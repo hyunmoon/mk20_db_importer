@@ -8,8 +8,9 @@ Safety model:
   - Default is no production insert.
   - Production insert requires --execute and --ack-db-direct.
   - Full batch additionally requires --allow-full-batch.
-  - Stage excludes anything already present in current Curio DB by deal id, piece CID, allocation id,
-    waiting queue, download pipeline, mk20 pipeline, and sectors_sdr_initial_pieces.
+  - Stage excludes anything already present in current Curio DB by deal id or allocation id.
+  - Piece CID conflicts are scoped to the same provider/miner so cross-provider replicas are allowed.
+  - Stage also checks waiting queue, download pipeline, mk20 pipeline, and sectors_sdr_initial_pieces.
   - Insert SQL rechecks conflicts at insert time.
   - Each production insert has a run_id and writes an audit manifest.
   - Rollback and verify SQL are generated for that run_id.
@@ -35,7 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-VERSION = "2026-06-27-public-safe"
+VERSION = "2026-07-04-provider-aware-piece-conflicts"
 EXPECTED_CSV_COLUMNS = ["data_cid", "piece_cid_v1", "pcidv2", "piece_size", "car_size", "car_url"]
 
 
@@ -162,7 +163,29 @@ def read_allocations(path: Path) -> List[Allocation]:
     with path.open("r", encoding="utf-8") as f:
         obj = json.load(f)
     if isinstance(obj, dict):
-        records = list(obj.values())
+        # Support both FilPlus list forms:
+        #   {"allocations": {"123": {...}}}
+        #   {"Allocations": {"123": {...}}}
+        # and older flat mappings keyed by allocation id.
+        nested = get_any(obj, ["allocations", "Allocations"])
+        if isinstance(nested, dict):
+            records = []
+            for aid, rec in nested.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec2 = dict(rec)
+                rec2.setdefault("allocationid", aid)
+                rec2.setdefault("allocation_id", aid)
+                records.append(rec2)
+        else:
+            records = []
+            for aid, rec in obj.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec2 = dict(rec)
+                rec2.setdefault("allocationid", aid)
+                rec2.setdefault("allocation_id", aid)
+                records.append(rec2)
     elif isinstance(obj, list):
         records = obj
     else:
@@ -342,34 +365,54 @@ def write_candidates_csv(path: Path, candidates: List[Candidate], provider: str,
 
 
 def conflict_predicate(alias: str = "s") -> str:
-    # Used in multiple places. This excludes every current DB artifact that would mean the deal/piece/allocation is already known.
+    # Used in multiple places. Deal id and allocation id conflicts are global.
+    # Piece CID conflicts are provider-scoped so the same piece can be imported
+    # for multiple miners/providers as independent replicas.
     return f"""
   EXISTS (SELECT 1 FROM market_mk20_deal d WHERE d.id = {alias}.deal_id)
   OR EXISTS (SELECT 1 FROM market_mk20_pipeline_waiting w WHERE w.id = {alias}.deal_id)
   OR EXISTS (
     SELECT 1 FROM market_mk20_deal d
-    WHERE d.piece_cid_v2 = {alias}.piece_cid_v2
-       OR d.data #>> '{{piece_cid,/}}' = {alias}.piece_cid_v2
-       OR d.ddo_v1 #>> '{{ddo,allocation_id}}' = {alias}.allocation_id::TEXT
+    WHERE d.ddo_v1 #>> '{{ddo,allocation_id}}' = {alias}.allocation_id::TEXT
+       OR (
+            d.ddo_v1 #>> '{{ddo,provider}}' = {alias}.provider
+            AND (
+              d.piece_cid_v2 = {alias}.piece_cid_v2
+              OR d.data #>> '{{piece_cid,/}}' = {alias}.piece_cid_v2
+            )
+          )
   )
   OR EXISTS (
     SELECT 1
     FROM market_mk20_pipeline_waiting w
     JOIN market_mk20_deal d ON d.id = w.id
-    WHERE d.piece_cid_v2 = {alias}.piece_cid_v2
-       OR d.data #>> '{{piece_cid,/}}' = {alias}.piece_cid_v2
-       OR d.ddo_v1 #>> '{{ddo,allocation_id}}' = {alias}.allocation_id::TEXT
+    WHERE d.ddo_v1 #>> '{{ddo,allocation_id}}' = {alias}.allocation_id::TEXT
+       OR (
+            d.ddo_v1 #>> '{{ddo,provider}}' = {alias}.provider
+            AND (
+              d.piece_cid_v2 = {alias}.piece_cid_v2
+              OR d.data #>> '{{piece_cid,/}}' = {alias}.piece_cid_v2
+            )
+          )
   )
   OR EXISTS (
-    SELECT 1 FROM market_mk20_download_pipeline p
-    WHERE p.id = {alias}.deal_id OR p.piece_cid_v2 = {alias}.piece_cid_v2
+    SELECT 1
+    FROM market_mk20_download_pipeline p
+    LEFT JOIN market_mk20_deal d ON d.id = p.id
+    WHERE p.id = {alias}.deal_id
+       OR (
+            d.ddo_v1 #>> '{{ddo,provider}}' = {alias}.provider
+            AND p.piece_cid_v2 = {alias}.piece_cid_v2
+          )
   )
   OR EXISTS (
     SELECT 1 FROM market_mk20_pipeline p
     WHERE p.id = {alias}.deal_id
-       OR p.piece_cid_v2 = {alias}.piece_cid_v2
-       OR p.piece_cid = {alias}.piece_cid_v1
        OR p.allocation_id = {alias}.allocation_id
+       OR (
+            p.sp_id = {alias}.provider_id
+            AND (p.piece_cid_v2 = {alias}.piece_cid_v2 OR p.piece_cid = {alias}.piece_cid_v1)
+          )
   )
   OR EXISTS (
     SELECT 1 FROM sectors_sdr_initial_pieces p
@@ -481,48 +524,91 @@ WHERE batch_name = {sql_literal(batch_name)}
   AND EXISTS (SELECT 1 FROM market_mk20_pipeline_waiting w WHERE w.id = s.deal_id);
 
 UPDATE {stage_table} s
-SET db_reject_reason = 'piece or allocation already exists in market_mk20_deal'
+SET db_reject_reason = 'allocation already exists in market_mk20_deal'
 WHERE batch_name = {sql_literal(batch_name)}
   AND file_reject_reason IS NULL AND db_reject_reason IS NULL
   AND EXISTS (
     SELECT 1 FROM market_mk20_deal d
-    WHERE d.piece_cid_v2 = s.piece_cid_v2
-       OR d.data #>> '{{piece_cid,/}}' = s.piece_cid_v2
-       OR d.ddo_v1 #>> '{{ddo,allocation_id}}' = s.allocation_id::TEXT
+    WHERE d.ddo_v1 #>> '{{ddo,allocation_id}}' = s.allocation_id::TEXT
   );
 
 UPDATE {stage_table} s
-SET db_reject_reason = 'piece or allocation already in market_mk20_pipeline_waiting'
+SET db_reject_reason = 'same-provider piece already exists in market_mk20_deal'
+WHERE batch_name = {sql_literal(batch_name)}
+  AND file_reject_reason IS NULL AND db_reject_reason IS NULL
+  AND EXISTS (
+    SELECT 1 FROM market_mk20_deal d
+    WHERE d.ddo_v1 #>> '{{ddo,provider}}' = s.provider
+      AND (
+        d.piece_cid_v2 = s.piece_cid_v2
+        OR d.data #>> '{{piece_cid,/}}' = s.piece_cid_v2
+      )
+  );
+
+UPDATE {stage_table} s
+SET db_reject_reason = 'allocation already in market_mk20_pipeline_waiting'
 WHERE batch_name = {sql_literal(batch_name)}
   AND file_reject_reason IS NULL AND db_reject_reason IS NULL
   AND EXISTS (
     SELECT 1
     FROM market_mk20_pipeline_waiting w
     JOIN market_mk20_deal d ON d.id = w.id
-    WHERE d.piece_cid_v2 = s.piece_cid_v2
-       OR d.data #>> '{{piece_cid,/}}' = s.piece_cid_v2
-       OR d.ddo_v1 #>> '{{ddo,allocation_id}}' = s.allocation_id::TEXT
+    WHERE d.ddo_v1 #>> '{{ddo,allocation_id}}' = s.allocation_id::TEXT
   );
 
 UPDATE {stage_table} s
-SET db_reject_reason = 'piece or allocation already exists in market_mk20_download_pipeline'
+SET db_reject_reason = 'same-provider piece already in market_mk20_pipeline_waiting'
+WHERE batch_name = {sql_literal(batch_name)}
+  AND file_reject_reason IS NULL AND db_reject_reason IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM market_mk20_pipeline_waiting w
+    JOIN market_mk20_deal d ON d.id = w.id
+    WHERE d.ddo_v1 #>> '{{ddo,provider}}' = s.provider
+      AND (
+        d.piece_cid_v2 = s.piece_cid_v2
+        OR d.data #>> '{{piece_cid,/}}' = s.piece_cid_v2
+      )
+  );
+
+UPDATE {stage_table} s
+SET db_reject_reason = 'deal id already exists in market_mk20_download_pipeline'
 WHERE batch_name = {sql_literal(batch_name)}
   AND file_reject_reason IS NULL AND db_reject_reason IS NULL
   AND EXISTS (
     SELECT 1 FROM market_mk20_download_pipeline p
-    WHERE p.id = s.deal_id OR p.piece_cid_v2 = s.piece_cid_v2
+    WHERE p.id = s.deal_id
   );
 
 UPDATE {stage_table} s
-SET db_reject_reason = 'piece or allocation already exists in market_mk20_pipeline'
+SET db_reject_reason = 'same-provider piece already exists in market_mk20_download_pipeline'
+WHERE batch_name = {sql_literal(batch_name)}
+  AND file_reject_reason IS NULL AND db_reject_reason IS NULL
+  AND EXISTS (
+    SELECT 1
+    FROM market_mk20_download_pipeline p
+    JOIN market_mk20_deal d ON d.id = p.id
+    WHERE d.ddo_v1 #>> '{{ddo,provider}}' = s.provider
+      AND p.piece_cid_v2 = s.piece_cid_v2
+  );
+
+UPDATE {stage_table} s
+SET db_reject_reason = 'allocation already exists in market_mk20_pipeline'
 WHERE batch_name = {sql_literal(batch_name)}
   AND file_reject_reason IS NULL AND db_reject_reason IS NULL
   AND EXISTS (
     SELECT 1 FROM market_mk20_pipeline p
-    WHERE p.id = s.deal_id
-       OR p.piece_cid_v2 = s.piece_cid_v2
-       OR p.piece_cid = s.piece_cid_v1
-       OR p.allocation_id = s.allocation_id
+    WHERE p.allocation_id = s.allocation_id
+  );
+
+UPDATE {stage_table} s
+SET db_reject_reason = 'same-provider piece already exists in market_mk20_pipeline'
+WHERE batch_name = {sql_literal(batch_name)}
+  AND file_reject_reason IS NULL AND db_reject_reason IS NULL
+  AND EXISTS (
+    SELECT 1 FROM market_mk20_pipeline p
+    WHERE p.sp_id = s.provider_id
+      AND (p.piece_cid_v2 = s.piece_cid_v2 OR p.piece_cid = s.piece_cid_v1)
   );
 
 UPDATE {stage_table} s
@@ -941,9 +1027,15 @@ def main() -> int:
 
     allocations = read_allocations(args.allocations)
     allocations_by_piece: Dict[str, List[Allocation]] = defaultdict(list)
+    matching_allocations = 0
     for a in allocations:
-        if a.piece_cid:
-            allocations_by_piece[a.piece_cid].append(a)
+        # Allocation JSONs may contain multiple miners/providers. Only allocations
+        # for this client, provider, and piece size should participate in the
+        # per-piece lookup. Cross-provider duplicates are normal replicas.
+        if a.client == args.client_id and a.miner == args.provider_id and a.piece_size == args.piece_size:
+            matching_allocations += 1
+            if a.piece_cid:
+                allocations_by_piece[a.piece_cid].append(a)
 
     candidates = read_csv_candidates(
         args.csv, args.batch_name, id_time_ms, allocations_by_piece,
@@ -973,6 +1065,7 @@ def main() -> int:
     print(f"mk20_db_importer version: {VERSION}")
     print(f"run id: {run_id}")
     print(f"allocations: {len(allocations)} records")
+    print(f"matching allocations for provider/client/size: {matching_allocations}")
     print(f"csv rows: {total}")
     print(f"file-valid candidates: {file_valid}")
     print(f"file-rejected candidates: {file_rejected}")
