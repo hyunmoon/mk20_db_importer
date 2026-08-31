@@ -21,6 +21,8 @@ that sptool used as --wallet. client_id is the numeric DataCap allocation client
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import csv
 import hashlib
 import json
@@ -39,8 +41,12 @@ from urllib.parse import urlparse
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 VERSION = "2026-09-01-production-safety-hardening"
 EXPECTED_CSV_COLUMNS = ["data_cid", "piece_cid_v1", "pcidv2", "piece_size", "car_size", "car_url"]
-SAFE_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 STAGE_TABLE_PREFIX = "audit_mk20_import_"
+CID_VERSION = 1
+RAW_CODEC = 0x55
+FIL_COMMITMENT_UNSEALED_CODEC = 0xF101
+PIECE_CID_V2_MULTIHASH = 0x1011
+PIECE_CID_V1_MULTIHASH = 0x1012
 
 
 def eprint(*args: Any) -> None:
@@ -56,13 +62,31 @@ def sql_ident(name: str) -> str:
 
 
 def safe_label(value: str, label: str) -> str:
-    # Labels are used in output filenames, comments, audit keys, and generated SQL.
-    if not SAFE_LABEL_RE.fullmatch(value):
+    # Labels become filename components and audit keys. Preserve human-readable
+    # labels (including spaces) while rejecting path separators and line/control
+    # characters that can escape the output directory or generated SQL comments.
+    if (
+        not value
+        or len(value) > 128
+        or any(forbidden in value for forbidden in ("\r", "\n", "\x00", "/", "\\"))
+    ):
         raise ValueError(
-            f"unsafe {label}: {value!r}; use 1-128 ASCII letters, digits, '.', '_', or '-', "
-            "starting with a letter or digit"
+            f"unsafe {label}: {value!r}; use 1-128 characters without CR, LF, NUL, '/', or '\\'"
         )
     return value
+
+
+def validate_provider_id_address(provider: str, provider_id: int) -> int:
+    match = re.fullmatch(r"[ft]0([0-9]+)", provider)
+    if match is None:
+        raise ValueError("--provider must be a Filecoin ID address (f0... or t0...)")
+    address_id = int(match.group(1))
+    if address_id != provider_id:
+        raise ValueError(
+            f"--provider {provider!r} resolves to actor ID {address_id}, "
+            f"not --provider-id {provider_id}"
+        )
+    return address_id
 
 
 def validate_stage_table(name: str) -> str:
@@ -109,6 +133,117 @@ def get_any(d: Dict[str, Any], names: Iterable[str], default: Any = None) -> Any
         if name.lower() in lowered:
             return lowered[name.lower()]
     return default
+
+
+@dataclass(frozen=True)
+class PieceCidV2Info:
+    piece_cid_v1: str
+    padded_size: int
+    payload_size: int
+    padding: int
+    tree_height: int
+
+
+def _read_uvarint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    for index in range(10):
+        position = offset + index
+        if position >= len(data):
+            raise ValueError("truncated unsigned varint")
+        byte = data[position]
+        if index == 9 and byte > 1:
+            raise ValueError("unsigned varint exceeds 64 bits")
+        value |= (byte & 0x7F) << (7 * index)
+        if byte < 0x80:
+            if index > 0 and byte == 0:
+                raise ValueError("non-canonical unsigned varint")
+            return value, position + 1
+    raise ValueError("unsigned varint exceeds 10 bytes")
+
+
+def _encode_uvarint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("cannot encode a negative unsigned varint")
+    encoded = bytearray()
+    while value >= 0x80:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _decode_base32_cid(value: str) -> bytes:
+    if not value.startswith("b") or value != value.lower():
+        raise ValueError("CID must use canonical lowercase base32 multibase")
+    payload = value[1:]
+    if not payload:
+        raise ValueError("CID has no base32 payload")
+    padded = payload.upper() + "=" * ((8 - len(payload) % 8) % 8)
+    try:
+        decoded = base64.b32decode(padded, casefold=False)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("CID has invalid base32 data") from exc
+    if _encode_base32_cid(decoded) != value:
+        raise ValueError("CID is not canonical base32")
+    return decoded
+
+
+def _encode_base32_cid(value: bytes) -> str:
+    return "b" + base64.b32encode(value).decode("ascii").lower().rstrip("=")
+
+
+def piece_cid_v2_info(piece_cid_v2: str) -> PieceCidV2Info:
+    data = _decode_base32_cid(piece_cid_v2)
+    version, offset = _read_uvarint(data, 0)
+    codec, offset = _read_uvarint(data, offset)
+    multihash_code, offset = _read_uvarint(data, offset)
+    digest_length, offset = _read_uvarint(data, offset)
+    if version != CID_VERSION:
+        raise ValueError(f"PieceCIDv2 must be CIDv1, got version {version}")
+    if codec != RAW_CODEC:
+        raise ValueError(f"PieceCIDv2 must use raw codec 0x{RAW_CODEC:x}")
+    if multihash_code != PIECE_CID_V2_MULTIHASH:
+        raise ValueError(
+            f"PieceCIDv2 must use multihash 0x{PIECE_CID_V2_MULTIHASH:x}"
+        )
+    digest = data[offset:]
+    if len(digest) != digest_length:
+        raise ValueError("PieceCIDv2 multihash digest length is inconsistent")
+
+    padding, digest_offset = _read_uvarint(digest, 0)
+    if digest_offset >= len(digest):
+        raise ValueError("PieceCIDv2 digest is missing tree height")
+    tree_height = digest[digest_offset]
+    root = digest[digest_offset + 1 :]
+    if len(root) != 32:
+        raise ValueError("PieceCIDv2 commitment root must be 32 bytes")
+    if tree_height < 2:
+        raise ValueError("PieceCIDv2 tree height is below the minimum piece size")
+
+    padded_size = 32 << tree_height
+    if padded_size > (1 << 63) - 1:
+        raise ValueError("PieceCIDv2 padded size exceeds signed BIGINT range")
+    unpadded_capacity = padded_size * 127 // 128
+    if padding > unpadded_capacity:
+        raise ValueError("PieceCIDv2 padding exceeds unpadded piece capacity")
+    payload_size = unpadded_capacity - padding
+
+    v1_bytes = b"".join(
+        [
+            _encode_uvarint(CID_VERSION),
+            _encode_uvarint(FIL_COMMITMENT_UNSEALED_CODEC),
+            _encode_uvarint(PIECE_CID_V1_MULTIHASH),
+            _encode_uvarint(len(root)),
+            root,
+        ]
+    )
+    return PieceCidV2Info(
+        piece_cid_v1=_encode_base32_cid(v1_bytes),
+        padded_size=padded_size,
+        payload_size=payload_size,
+        padding=padding,
+        tree_height=tree_height,
+    )
 
 
 @dataclass
@@ -201,6 +336,10 @@ def read_allocations(path: Path) -> List[Allocation]:
                 rec2.setdefault("allocationid", aid)
                 rec2.setdefault("allocation_id", aid)
                 records.append(rec2)
+        elif isinstance(nested, list):
+            records = nested
+        elif nested is not None:
+            raise ValueError("'allocations' must be a list or object")
         else:
             records = []
             for aid, rec in obj.items():
@@ -296,6 +435,8 @@ def read_csv_candidates(
                 reasons.append("invalid piece_size")
             try:
                 car_size = int(row.get("car_size") or "")
+                if car_size <= 0:
+                    reasons.append("car_size must be positive")
             except Exception:
                 car_size = -1
                 reasons.append("invalid car_size")
@@ -310,6 +451,21 @@ def read_csv_candidates(
                 reasons.append("missing car_url")
             if piece_size != piece_size_expected:
                 reasons.append(f"csv piece_size mismatch: {piece_size} != {piece_size_expected}")
+            if piece_cid_v2:
+                try:
+                    piece_info = piece_cid_v2_info(piece_cid_v2)
+                except ValueError as exc:
+                    reasons.append(f"invalid pcidv2: {exc}")
+                else:
+                    if piece_cid_v1 and piece_info.piece_cid_v1 != piece_cid_v1:
+                        reasons.append(
+                            "pcidv2 commitment does not match piece_cid_v1"
+                        )
+                    if piece_size >= 0 and piece_info.padded_size != piece_size:
+                        reasons.append(
+                            "pcidv2 padded size does not match csv piece_size: "
+                            f"{piece_info.padded_size} != {piece_size}"
+                        )
             if car_url:
                 url_error = car_url_validation_error(piece_cid_v1, car_url)
                 if url_error:
@@ -372,6 +528,23 @@ def read_csv_candidates(
             if value in dup_values:
                 extra = f"{label}: {value}"
                 c.file_reject_reason = f"{c.file_reject_reason}; {extra}" if c.file_reject_reason else extra
+
+    allocation_counts = Counter(
+        c.allocation_id for c in out if c.allocation_id is not None
+    )
+    duplicate_allocation_ids = {
+        allocation_id
+        for allocation_id, count in allocation_counts.items()
+        if count > 1
+    }
+    for c in out:
+        if c.allocation_id in duplicate_allocation_ids:
+            extra = f"duplicate allocation_id in csv batch: {c.allocation_id}"
+            c.file_reject_reason = (
+                f"{c.file_reject_reason}; {extra}"
+                if c.file_reject_reason
+                else extra
+            )
     return out
 
 
@@ -957,6 +1130,8 @@ BEGIN
    AND (
         p.piece_cid = i.piece_cid_v1
         OR p.piece_cid = i.piece_cid_v2
+        OR p.direct_piece_activation_manifest #>> '{{CID,/}}' = i.piece_cid_v1
+        OR p.direct_piece_activation_manifest #>> '{{CID,/}}' = i.piece_cid_v2
         OR p.direct_piece_activation_manifest #>> '{{VerifiedAllocationKey,ID}}' = i.allocation_id::TEXT
    )
   WHERE i.run_id = {sql_literal(run_id)};
@@ -1051,6 +1226,8 @@ JOIN audit_mk20_import_inserted i
  AND (
       p.piece_cid = i.piece_cid_v1
       OR p.piece_cid = i.piece_cid_v2
+      OR p.direct_piece_activation_manifest #>> '{{CID,/}}' = i.piece_cid_v1
+      OR p.direct_piece_activation_manifest #>> '{{CID,/}}' = i.piece_cid_v2
       OR p.direct_piece_activation_manifest #>> '{{VerifiedAllocationKey,ID}}' = i.allocation_id::TEXT
  )
 WHERE i.run_id = {sql_literal(run_id)};
@@ -1103,16 +1280,22 @@ def main() -> int:
     ap.add_argument("--allow-full-batch", action="store_true")
     args = ap.parse_args()
 
-    safe_label(args.batch_name, "batch name")
-    validate_stage_table(args.stage_table)
-    if args.run_id is not None:
-        safe_label(args.run_id, "run id")
+    try:
+        safe_label(args.batch_name, "batch name")
+        validate_stage_table(args.stage_table)
+        if args.run_id is not None:
+            safe_label(args.run_id, "run id")
+        validate_provider_id_address(args.provider, args.provider_id)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.client_id <= 0 or args.provider_id <= 0:
         raise SystemExit("--client-id and --provider-id must be positive")
     if args.piece_size <= 0 or args.duration <= 0:
         raise SystemExit("--piece-size and --duration must be positive")
     if args.limit is not None and args.limit <= 0:
         raise SystemExit("--limit must be a positive integer when specified")
+    if args.no_db and args.execute:
+        raise SystemExit("--no-db cannot be combined with --execute")
     for option, value in [
         ("--deal-client", args.deal_client),
         ("--provider", args.provider),
