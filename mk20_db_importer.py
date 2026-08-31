@@ -25,6 +25,7 @@ import csv
 import hashlib
 import json
 import posixpath
+import re
 import shlex
 import subprocess
 import sys
@@ -36,8 +37,10 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-VERSION = "2026-07-04-provider-aware-piece-conflicts"
+VERSION = "2026-09-01-production-safety-hardening"
 EXPECTED_CSV_COLUMNS = ["data_cid", "piece_cid_v1", "pcidv2", "piece_size", "car_size", "car_url"]
+SAFE_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+STAGE_TABLE_PREFIX = "audit_mk20_import_"
 
 
 def eprint(*args: Any) -> None:
@@ -45,8 +48,29 @@ def eprint(*args: Any) -> None:
 
 
 def sql_ident(name: str) -> str:
-    if not name.replace("_", "").isalnum() or name[0].isdigit():
+    # PostgreSQL truncates identifiers after 63 bytes. Restricting identifiers to
+    # ASCII and the server limit prevents lookalikes and truncation collisions.
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", name):
         raise ValueError(f"unsafe SQL identifier: {name!r}")
+    return name
+
+
+def safe_label(value: str, label: str) -> str:
+    # Labels are used in output filenames, comments, audit keys, and generated SQL.
+    if not SAFE_LABEL_RE.fullmatch(value):
+        raise ValueError(
+            f"unsafe {label}: {value!r}; use 1-128 ASCII letters, digits, '.', '_', or '-', "
+            "starting with a letter or digit"
+        )
+    return value
+
+
+def validate_stage_table(name: str) -> str:
+    name = sql_ident(name)
+    if not name.startswith(STAGE_TABLE_PREFIX):
+        raise ValueError(
+            f"unsafe stage table {name!r}: it must start with {STAGE_TABLE_PREFIX!r}"
+        )
     return name
 
 
@@ -229,6 +253,21 @@ def car_url_filename_matches(piece_cid_v1: str, car_url: str) -> bool:
     return base == f"{piece_cid_v1}.car"
 
 
+def car_url_validation_error(piece_cid_v1: str, car_url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(car_url)
+        hostname = parsed.hostname
+    except ValueError:
+        return "car_url is malformed"
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not hostname:
+        return "car_url must be an absolute http(s) URL"
+    if parsed.username is not None or parsed.password is not None:
+        return "car_url must not contain embedded credentials"
+    if piece_cid_v1 and not car_url_filename_matches(piece_cid_v1, car_url):
+        return "car_url basename does not equal <piece_cid_v1>.car"
+    return None
+
+
 def read_csv_candidates(
     path: Path,
     batch_name: str,
@@ -271,8 +310,10 @@ def read_csv_candidates(
                 reasons.append("missing car_url")
             if piece_size != piece_size_expected:
                 reasons.append(f"csv piece_size mismatch: {piece_size} != {piece_size_expected}")
-            if car_url and piece_cid_v1 and not car_url_filename_matches(piece_cid_v1, car_url):
-                reasons.append("car_url basename does not equal <piece_cid_v1>.car")
+            if car_url:
+                url_error = car_url_validation_error(piece_cid_v1, car_url)
+                if url_error:
+                    reasons.append(url_error)
 
             key = f"{batch_name}:{i}:{piece_cid_v1}:{piece_cid_v2}"
             c = Candidate(
@@ -305,10 +346,19 @@ def read_csv_candidates(
                     reasons.append(f"allocation piece_size mismatch: {a.piece_size} != {piece_size_expected}")
                 if a.piece_cid != piece_cid_v1:
                     reasons.append("allocation piece CID mismatch")
-                if a.term_min > duration:
-                    reasons.append(f"allocation term_min > deal duration: {a.term_min} > {duration}")
-                if a.term_max > duration:
-                    reasons.append(f"allocation term_max > deal duration: {a.term_max} > {duration}")
+                if a.term_min < 0 or a.term_max < a.term_min:
+                    reasons.append(
+                        f"allocation term range is invalid: {a.term_min}..{a.term_max}"
+                    )
+                else:
+                    if duration < a.term_min:
+                        reasons.append(
+                            f"deal duration below allocation term_min: {duration} < {a.term_min}"
+                        )
+                    if duration > a.term_max:
+                        reasons.append(
+                            f"deal duration above allocation term_max: {duration} > {a.term_max}"
+                        )
 
             c.file_reject_reason = "; ".join(reasons) if reasons else None
             out.append(c)
@@ -429,7 +479,7 @@ def conflict_predicate(alias: str = "s") -> str:
 
 
 def generate_stage_sql(validated_csv: Path, batch_name: str, stage_table: str, replace_stage: bool, reset_stage_table: bool) -> str:
-    stage_table = sql_ident(stage_table)
+    stage_table = validate_stage_table(stage_table)
     csv_path = str(validated_csv.resolve())
     reset_sql = f"DROP TABLE IF EXISTS {stage_table};" if reset_stage_table else ""
     delete_sql = f"DELETE FROM {stage_table} WHERE batch_name = {sql_literal(batch_name)};" if replace_stage else ""
@@ -657,10 +707,20 @@ LIMIT 20;
 
 
 def generate_insert_sql(batch_name: str, stage_table: str, limit: Optional[int], run_id: str) -> str:
-    stage_table = sql_ident(stage_table)
+    stage_table = validate_stage_table(stage_table)
     limit_clause = f"LIMIT {int(limit)}" if limit is not None and limit > 0 else ""
+    empty_pick_message = sql_literal(
+        f"No valid picked rows for run_id={run_id} batch={batch_name}"
+    )
+    count_mismatch_message = sql_literal(
+        f"Insert count mismatch for run_id={run_id}: picked %, deal %, waiting %"
+    )
     return f"""
-BEGIN;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- Serialize importer runs across the distributed YSQL cluster. This cooperative
+-- transaction lock is released automatically on commit or rollback.
+SELECT pg_advisory_xact_lock(1296778320);
 
 CREATE TABLE IF NOT EXISTS audit_mk20_import_runs (
   run_id TEXT PRIMARY KEY,
@@ -709,7 +769,7 @@ DECLARE n BIGINT;
 BEGIN
   SELECT COUNT(*) INTO n FROM picked;
   IF n = 0 THEN
-    RAISE EXCEPTION 'No valid picked rows for run_id={run_id} batch={batch_name}';
+    RAISE EXCEPTION {empty_pick_message};
   END IF;
 END $$;
 
@@ -761,7 +821,7 @@ BEGIN
   SELECT expected_rows, inserted_deals, inserted_waiting INTO p, d, w
   FROM audit_mk20_import_runs WHERE run_id = {sql_literal(run_id)};
   IF p IS NULL OR d IS NULL OR w IS NULL OR p <> d OR p <> w THEN
-    RAISE EXCEPTION 'Insert count mismatch for run_id={run_id}: picked %, deal %, waiting %', p, d, w;
+    RAISE EXCEPTION {count_mismatch_message}, p, d, w;
   END IF;
 END $$;
 
@@ -774,7 +834,7 @@ WHERE run_id = {sql_literal(run_id)};
 
 
 def generate_verify_sql(batch_name: str, stage_table: str, run_id: str) -> str:
-    stage_table = sql_ident(stage_table)
+    stage_table = validate_stage_table(stage_table)
     return f"""
 -- Verification for mk20 importer run_id={run_id}
 \nSELECT 'run_manifest' AS section, *
@@ -809,7 +869,8 @@ WHERE i.run_id = {sql_literal(run_id)};
 SELECT 'bad_client' AS problem, d.id, d.client, i.deal_client
 FROM market_mk20_deal d
 JOIN audit_mk20_import_inserted i ON i.deal_id = d.id
-WHERE i.run_id = {sql_literal(run_id)} AND d.client <> i.deal_client;
+WHERE i.run_id = {sql_literal(run_id)}
+  AND d.client IS DISTINCT FROM i.deal_client;
 
 SELECT 'bad_provider_or_allocation' AS problem, d.id,
        d.ddo_v1 #>> '{{ddo,provider}}' AS provider,
@@ -820,8 +881,8 @@ FROM market_mk20_deal d
 JOIN audit_mk20_import_inserted i ON i.deal_id = d.id
 WHERE i.run_id = {sql_literal(run_id)}
   AND (
-    d.ddo_v1 #>> '{{ddo,provider}}' <> i.provider
-    OR d.ddo_v1 #>> '{{ddo,allocation_id}}' <> i.allocation_id::TEXT
+    d.ddo_v1 #>> '{{ddo,provider}}' IS DISTINCT FROM i.provider
+    OR d.ddo_v1 #>> '{{ddo,allocation_id}}' IS DISTINCT FROM i.allocation_id::TEXT
   );
 
 SELECT 'bad_piece_or_url' AS problem, d.id,
@@ -832,15 +893,24 @@ FROM market_mk20_deal d
 JOIN audit_mk20_import_inserted i ON i.deal_id = d.id
 WHERE i.run_id = {sql_literal(run_id)}
   AND (
-    d.piece_cid_v2 <> i.piece_cid_v2
-    OR d.data #>> '{{piece_cid,/}}' <> i.piece_cid_v2
-    OR d.data #>> '{{source_http,urls,0,url}}' <> i.car_url
+    d.piece_cid_v2 IS DISTINCT FROM i.piece_cid_v2
+    OR d.data #>> '{{piece_cid,/}}' IS DISTINCT FROM i.piece_cid_v2
+    OR d.data #>> '{{source_http,urls,0,url}}' IS DISTINCT FROM i.car_url
   );
 
-SELECT 'duplicate_piece_cid_v2_in_market_mk20_deal' AS problem, d.piece_cid_v2, COUNT(*) AS count
+SELECT 'duplicate_piece_cid_v2_in_market_mk20_deal' AS problem,
+       d.ddo_v1 #>> '{{ddo,provider}}' AS provider,
+       d.piece_cid_v2,
+       COUNT(*) AS count
 FROM market_mk20_deal d
-WHERE d.piece_cid_v2 IN (SELECT piece_cid_v2 FROM audit_mk20_import_inserted WHERE run_id = {sql_literal(run_id)})
-GROUP BY d.piece_cid_v2
+WHERE EXISTS (
+  SELECT 1
+  FROM audit_mk20_import_inserted i
+  WHERE i.run_id = {sql_literal(run_id)}
+    AND i.provider = d.ddo_v1 #>> '{{ddo,provider}}'
+    AND i.piece_cid_v2 = d.piece_cid_v2
+)
+GROUP BY d.ddo_v1 #>> '{{ddo,provider}}', d.piece_cid_v2
 HAVING COUNT(*) > 1;
 
 SELECT 'duplicate_allocation_in_market_mk20_deal' AS problem, d.ddo_v1 #>> '{{ddo,allocation_id}}' AS allocation_id, COUNT(*) AS count
@@ -901,6 +971,15 @@ SELECT deal_id, piece_cid_v1, piece_cid_v2, allocation_id, car_url
 FROM audit_mk20_import_inserted
 WHERE run_id = {sql_literal(run_id)};
 
+DO $$
+DECLARE n BIGINT;
+BEGIN
+  SELECT COUNT(*) INTO n FROM rollback_ids;
+  IF n = 0 THEN
+    RAISE EXCEPTION 'Refusing rollback: run_id has no audited inserted rows';
+  END IF;
+END $$;
+
 CREATE TEMP TABLE rollback_ref_ids AS
 SELECT DISTINCT unnest(p.ref_ids) AS ref_id
 FROM market_mk20_download_pipeline p
@@ -909,7 +988,14 @@ JOIN rollback_ids r ON r.deal_id = p.id;
 DELETE FROM market_mk20_pipeline_waiting w USING rollback_ids r WHERE w.id = r.deal_id;
 DELETE FROM market_mk20_pipeline p USING rollback_ids r WHERE p.id = r.deal_id;
 DELETE FROM market_mk20_download_pipeline p USING rollback_ids r WHERE p.id = r.deal_id;
-DELETE FROM parked_piece_refs pr USING rollback_ref_ids rr WHERE pr.ref_id = rr.ref_id;
+DELETE FROM parked_piece_refs pr
+USING rollback_ref_ids rr
+WHERE pr.ref_id = rr.ref_id
+  AND NOT EXISTS (
+    SELECT 1
+    FROM market_mk20_download_pipeline remaining
+    WHERE rr.ref_id = ANY(remaining.ref_ids)
+  );
 DELETE FROM market_mk20_deal d USING rollback_ids r WHERE d.id = r.deal_id;
 
 -- Keep audit rows intentionally, so the rollback remains traceable.
@@ -984,9 +1070,12 @@ LIMIT 50;
 
 
 def run_psql(psql_cmd: str, sql_file: Path) -> None:
-    cmd = f"{psql_cmd} -v ON_ERROR_STOP=1 -f {shlex.quote(str(sql_file))}"
-    eprint(f"+ {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    cmd = shlex.split(psql_cmd)
+    if not cmd:
+        raise ValueError("--psql-cmd must contain an executable")
+    cmd.extend(["-v", "ON_ERROR_STOP=1", "-f", str(sql_file)])
+    eprint(f"+ {shlex.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
 
 def main() -> int:
@@ -1014,16 +1103,33 @@ def main() -> int:
     ap.add_argument("--allow-full-batch", action="store_true")
     args = ap.parse_args()
 
-    sql_ident(args.stage_table)
+    safe_label(args.batch_name, "batch name")
+    validate_stage_table(args.stage_table)
+    if args.run_id is not None:
+        safe_label(args.run_id, "run id")
+    if args.client_id <= 0 or args.provider_id <= 0:
+        raise SystemExit("--client-id and --provider-id must be positive")
+    if args.piece_size <= 0 or args.duration <= 0:
+        raise SystemExit("--piece-size and --duration must be positive")
+    if args.limit is not None and args.limit <= 0:
+        raise SystemExit("--limit must be a positive integer when specified")
+    for option, value in [
+        ("--deal-client", args.deal_client),
+        ("--provider", args.provider),
+    ]:
+        if not value or value != value.strip() or "\x00" in value:
+            raise SystemExit(f"{option} must be non-empty and contain no surrounding whitespace or NUL")
     if args.execute:
         if not args.ack_db_direct:
             raise SystemExit("Refusing production insert: --execute requires --ack-db-direct")
-        if (args.limit is None or args.limit <= 0) and not args.allow_full_batch:
+        if args.limit is None and not args.allow_full_batch:
             raise SystemExit("Refusing full batch insert: specify --limit, or add --allow-full-batch intentionally")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     id_time_ms = args.id_time_ms if args.id_time_ms is not None else int(time.time() * 1000)
-    run_id = args.run_id or time.strftime(f"{args.batch_name}_%Y%m%d_%H%M%S")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_id = args.run_id or f"{args.batch_name}_{timestamp}"
+    safe_label(run_id, "run id")
 
     allocations = read_allocations(args.allocations)
     allocations_by_piece: Dict[str, List[Allocation]] = defaultdict(list)

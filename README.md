@@ -26,6 +26,11 @@ The tool is intentionally hard to run by accident:
 - Per-run `verify.sql`, `observe.sql`, and `rollback.sql` files are generated.
 - Rollback SQL refuses to proceed if imported pieces have already reached `sectors_sdr_initial_pieces`.
 - Insert SQL rechecks conflicts at insert time.
+- Production inserts run at serializable isolation and take a transaction-scoped advisory lock, so importer runs cannot overlap.
+- Batch/run labels and stage-table identifiers are restricted before paths or SQL are generated; `--reset-stage-table` can target only `audit_mk20_import_*` tables.
+- CAR sources must be absolute HTTP(S) URLs without embedded credentials, and deal duration must be inside the allocation's term range.
+- Database commands are launched as an argument vector, never through a shell.
+- Rollback refuses empty manifests and deletes parked-piece references only when no remaining download pipeline uses them.
 - The importer explicitly writes `market_mk20_deal.created_at = now()` to avoid schemas where the default timestamp expression is offset-shifted in non-UTC sessions.
 
 ## Public repo / secret hygiene
@@ -402,6 +407,16 @@ Keep these until the batch is fully sealed and audited:
 - generated `verify.sql`, `observe.sql`, and `rollback.sql`
 
 Temporary tables you intentionally created for manual queue isolation can be removed after restoration and verification. Do not delete audit manifest tables unless you no longer need traceability.
+
+## Development
+
+Run the dependency-free regression suite with:
+
+```bash
+python3 -m unittest -v
+```
+
+GitHub Actions runs the suite against the oldest and newest supported Python versions on every pull request and on pushes to `main` or `codex/**`.
 
 ## Limitations
 

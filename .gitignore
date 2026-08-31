@@ -1,0 +1,22 @@
+# macOS and Python
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+.pgpass
+
+# Operational inputs and generated importer artifacts
+*.csv
+*.json
+*.sql
+*.validated.csv
+mk20-import-out/
