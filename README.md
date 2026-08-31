@@ -26,9 +26,11 @@ The tool is intentionally hard to run by accident:
 - Per-run `verify.sql`, `observe.sql`, and `rollback.sql` files are generated.
 - Rollback SQL refuses to proceed if imported pieces have already reached `sectors_sdr_initial_pieces`.
 - Insert SQL rechecks conflicts at insert time.
-- Production inserts run at serializable isolation and take a transaction-scoped advisory lock, so importer runs cannot overlap.
-- Batch/run labels and stage-table identifiers are restricted before paths or SQL are generated; `--reset-stage-table` can target only `audit_mk20_import_*` tables.
-- CAR sources must be absolute HTTP(S) URLs without embedded credentials, and deal duration must be inside the allocation's term range.
+- Production inserts run at serializable isolation and every importer insert path takes the same transaction-scoped advisory lock before the final conflict check, so importer runs cannot overlap. This cooperative lock does **not** block unrelated Curio writers.
+- The advisory-lock path targets YugabyteDB v2025.1 or later with `ysql_yb_enable_advisory_locks=true` (the default on supported releases). If lock acquisition or serialization fails, `ON_ERROR_STOP=1` plus checked subprocess execution returns a failure; the importer does not suppress or retry it.
+- Batch/run labels accept 1-128 characters, including spaces, but reject CR, LF, NUL, `/`, and `\`. Stage-table identifiers are restricted separately; `--reset-stage-table` can target only `audit_mk20_import_*` tables.
+- CAR sources must be absolute HTTP(S) URLs with a hostname and without embedded credentials. CAR size must be positive, and deal duration must be inside the allocation's term range.
+- PieceCIDv2 is decoded according to FRC-0069 and must reproduce the CSV PieceCIDv1 and padded `piece_size`.
 - Database commands are launched as an argument vector, never through a shell.
 - Rollback refuses empty manifests and deletes parked-piece references only when no remaining download pipeline uses them.
 - The importer explicitly writes `market_mk20_deal.created_at = now()` to avoid schemas where the default timestamp expression is offset-shifted in non-UTC sessions.
@@ -61,11 +63,11 @@ data_cid,piece_cid_v1,pcidv2,piece_size,car_size,car_url
 
 `piece_cid_v1` is the Filecoin allocation piece CID and must match the basename of `car_url` as `<piece_cid_v1>.car`.
 
-`pcidv2` is the piece CID value stored in `market_mk20_deal.piece_cid_v2` and in `data.piece_cid`.
+`pcidv2` is the FRC-0069 PieceCIDv2 stored in `market_mk20_deal.piece_cid_v2` and in `data.piece_cid`. The importer decodes it locally, converts its commitment root to PieceCIDv1, and derives its padded size. Both must exactly match `piece_cid_v1` and `piece_size`; no database connection is needed for this validation.
 
 ### Active allocations JSON
 
-The allocation list can be a list or object whose values contain these fields, with common casing variants accepted:
+The allocation JSON may be a root list, a root object keyed by allocation ID, or an `{"allocations": ...}` wrapper whose value is either a list or object. Records contain these fields, with common casing variants accepted:
 
 - allocation id: `allocationid`, `allocation_id`, `ID`, or `id`
 - client actor id: `client` or `Client`
@@ -83,8 +85,8 @@ These are deliberately separate:
 
 - `--deal-client`: MK20 deal client address string stored in `market_mk20_deal.client`; usually the public wallet address that would have been used as `sptool --wallet`.
 - `--client-id`: numeric DataCap allocation client actor id used for allocation validation.
-- `--provider`: provider/miner address stored in DDO JSON.
-- `--provider-id`: numeric provider/miner actor id used for allocation and sector-table validation.
+- `--provider`: provider/miner Filecoin ID address (`f0...` or `t0...`) stored in DDO JSON.
+- `--provider-id`: numeric provider/miner actor id used for allocation and sector-table validation. It must equal the actor ID encoded by `--provider` (for example, `f03199233` pairs with `3199233`).
 
 Do not pass a private key. Do not pass a wallet file.
 
@@ -410,17 +412,21 @@ Temporary tables you intentionally created for manual queue isolation can be rem
 
 ## Development
 
-Run the dependency-free regression suite with:
+Run the complete dependency-free validation sequence with:
 
 ```bash
+python3 -m py_compile mk20_db_importer.py
+python3 -m py_compile test_mk20_db_importer.py
 python3 -m unittest -v
+git diff --check
 ```
 
-GitHub Actions runs the suite against the oldest and newest supported Python versions on every pull request and on pushes to `main` or `codex/**`.
+The PieceCID tests use the official FRC-0069/go-fil-commcid reference vectors for 508-byte, empty 32 GiB, and 1016-byte payloads. GitHub Actions runs the same compile, unit-test, and diff checks against the oldest and newest supported Python versions on every pull request and on pushes to `main` or `codex/**`.
 
 ## Limitations
 
-- This tool targets the Curio MK20 DDO schema verified for the current source flow. Reinspect Curio source and schema before using it with a new Curio version.
+- This tool targets the Curio MK20 DDO schema verified for the current source flow and YugabyteDB v2025.1+ for transaction-level advisory locks. Reinspect Curio source and schema before using it with a new Curio or database version.
+- The advisory lock coordinates this importer only. Curio and other database writers do not acquire it; serializable conflicts are intentionally surfaced to the operator as failures rather than retried automatically.
 - It does not verify chain state directly. It trusts the provided active allocation JSON and validates it against CSV and current Curio DB state.
 - It does not manage Curio backpressure. Large imports can create large waiting queues if Curio intake is paused or rate-limited.
 - It does not replace normal Curio monitoring, logs, or operational judgment.
