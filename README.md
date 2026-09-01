@@ -131,7 +131,7 @@ CLI and allocation validation includes:
 - `--no-db --execute` is rejected.
 - Every allocation ID must be positive.
 - Allocation lookup is restricted to the requested client, provider/miner, and piece size.
-- Each CSV piece must resolve to exactly one matching active allocation.
+- Each CSV piece must resolve to exactly one matching allocation in the supplied allocation JSON.
 - The CSV piece CID and allocation piece CID must match.
 - Deal duration must be within the allocation's valid `term_min` / `term_max` range, and an invalid allocation term range is rejected.
 
@@ -332,7 +332,11 @@ Verify immediately:
 $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.verify.sql"
 ```
 
-The manifest and count sections must agree, and every problem query must return zero rows.
+Within the run manifest, `expected_rows`, `inserted_deals`, and `inserted_waiting` must agree. `inserted_audit_count` and `deal_rows` should match the inserted run.
+
+`waiting_rows`, `download_pipeline_rows`, and `mk20_pipeline_rows` are live pipeline observations. They may differ as Curio consumes waiting rows and moves imported deals through the pipeline, including immediately after insertion.
+
+Every problem query must return zero rows.
 
 Then observe progression:
 
@@ -462,8 +466,10 @@ dup_piece AS (
 dup_alloc AS (
   SELECT d.ddo_v1 #>> '{ddo,allocation_id}' AS allocation_id
   FROM market_mk20_deal d
-  WHERE d.ddo_v1 #>> '{ddo,provider}' = '$PROVIDER'
-    AND d.ddo_v1 #>> '{ddo,allocation_id}' IS NOT NULL
+  WHERE d.ddo_v1 #>> '{ddo,allocation_id}' IN (
+    SELECT allocation_id::TEXT
+    FROM imported
+  )
   GROUP BY d.ddo_v1 #>> '{ddo,allocation_id}'
   HAVING COUNT(*) > 1
 )
