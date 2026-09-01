@@ -1,144 +1,205 @@
 # Curio MK20 DB Importer
 
-`mk20_db_importer.py` is a conservative SP/operator-side tool for enqueueing Curio MK20 DDO deals directly into Curio DB after validating a provider CSV against an active Filecoin Plus allocation list.
+`mk20_db_importer.py` is an SP/operator-side tool for validating Filecoin Plus allocations and enqueueing Curio MK20 DDO deals directly in Curio's database.
 
-It is intended for cases where the SP/operator has already received a provider deal CSV and an independently fetched active allocation list, but does not want to depend on the data provider running `sptool mk20-client deal` with a wallet.
+It is intended for an operator who already has a provider CSV and a freshly fetched allocation list. It does not sign with, load, or require a client private key or wallet file. It does require the public MK20 deal-client address because Curio stores that value in `market_mk20_deal.client`.
 
-This tool does **not** sign with, load, or require a client wallet private key. It still requires the public MK20 deal client address string because Curio stores that value in `market_mk20_deal.client`.
+> **Production warning:** `--execute` bypasses Curio's normal API and sanitize path and writes directly to production tables. Treat it as an operator-controlled production action. Start with one row, verify it, observe downstream progress, and scale only after the result is clean.
 
-## What it inserts
+## What production insertion writes
 
-For a normal MK20 DDO HTTP-source deal, Curio's HTTP submit path initially writes only:
+For a normal MK20 DDO HTTP-source deal, Curio's HTTP submission path initially writes:
 
 1. `market_mk20_deal`
 2. `market_mk20_pipeline_waiting`
 
-Curio's own background pipeline then consumes `market_mk20_pipeline_waiting` and creates downstream rows such as parked piece refs, download pipeline rows, and MK20 pipeline rows. This importer intentionally inserts only the initial deal row and waiting-queue row. It must not directly insert downstream pipeline tables.
+This importer follows that initial shape. Curio's background pipeline consumes the waiting row and creates downstream download, MK20 pipeline, parked-piece, and sector rows. The importer does not directly create those downstream production rows.
 
-## Safety model
+A production run also creates or updates importer-owned audit data:
 
-The tool is intentionally hard to run by accident:
+- `audit_mk20_import_runs`
+- `audit_mk20_import_inserted`
 
-- Default mode is dry-run/staging only.
-- Production insert requires both `--execute` and `--ack-db-direct`.
-- Full-batch insert additionally requires `--allow-full-batch`.
-- Each production insert gets a `run_id` and writes audit rows to `audit_mk20_import_runs` and `audit_mk20_import_inserted`.
-- Per-run `verify.sql`, `observe.sql`, and `rollback.sql` files are generated.
-- Rollback SQL refuses to proceed if imported pieces have already reached `sectors_sdr_initial_pieces`.
-- Insert SQL rechecks conflicts at insert time.
-- Production inserts run at serializable isolation and every importer insert path takes the same transaction-scoped advisory lock before the final conflict check, so importer runs cannot overlap. This cooperative lock does **not** block unrelated Curio writers.
-- The advisory-lock path targets YugabyteDB v2025.1 or later with `ysql_yb_enable_advisory_locks=true` (the default on supported releases). If lock acquisition or serialization fails, `ON_ERROR_STOP=1` plus checked subprocess execution returns a failure; the importer does not suppress or retry it.
-- Batch/run labels accept 1-128 characters, including spaces, but reject CR, LF, NUL, `/`, and `\`. Stage-table identifiers are restricted separately; `--reset-stage-table` can target only `audit_mk20_import_*` tables.
-- CAR sources must be absolute HTTP(S) URLs with a hostname and without embedded credentials. CAR size must be positive, and deal duration must be inside the allocation's term range.
-- PieceCIDv2 is decoded according to FRC-0069 and must reproduce the CSV PieceCIDv1 and padded `piece_size`.
-- Database commands are launched as an argument vector, never through a shell.
-- Rollback refuses empty manifests and deletes parked-piece references only when no remaining download pipeline uses them.
-- The importer explicitly writes `market_mk20_deal.created_at = now()` to avoid schemas where the default timestamp expression is offset-shifted in non-UTC sessions.
+## Three execution levels
 
-## Public repo / secret hygiene
+The importer has three distinct operating levels. Generating SQL is not the same as safely executing it.
 
-Do not commit real operational data. The following can contain sensitive operational details such as car URLs, client addresses, CIDs, DB paths, and generated SQL:
+| Level | Flags | Database effect |
+| --- | --- | --- |
+| **A. File-only validation** | Include `--no-db`; do not use `--execute` | Does not connect to YugabyteDB/PostgreSQL. Validates input files and generates the validated CSV plus stage, insert, verify, observe, and rollback SQL artifacts. Production tables are untouched. |
+| **B. DB staging / dry run** | Omit both `--no-db` and `--execute` | Executes only the generated stage SQL. It loads or updates the importer staging table, performs current DB-side conflict checks, and does **not** insert production MK20 deal rows. |
+| **C. Production direct-DB insertion** | Include `--execute --ack-db-direct` | Stages first, then executes the generated insert SQL in a serializable transaction. This bypasses Curio's normal API/sanitize path. |
+
+> **Generated SQL warning:** `--no-db` still writes an `insert.sql` file. If `--no-db` is run without `--limit`, that file may represent the entire valid batch. Do not manually execute a generated `insert.sql` unless its intended scope, batch, run ID, and selected rows have been verified. Prefer invoking the importer with the explicit production safeguards.
+
+`--limit` limits only the rows selected by the production insert SQL; it does not reduce file validation or DB staging. A production run without `--limit` additionally requires `--allow-full-batch`.
+
+## Safety and concurrency model
+
+- Production insertion requires both `--execute` and `--ack-db-direct`.
+- An unlimited production insertion additionally requires `--allow-full-batch`.
+- The insert transaction uses `SERIALIZABLE` isolation.
+- Before the final conflict-check-and-insert critical section, every importer insert run obtains the same transaction-scoped advisory lock.
+- The lock relies on YugabyteDB advisory-lock support. The documented target is YugabyteDB v2025.1 or later with `ysql_yb_enable_advisory_locks=true`.
+- The advisory lock is **cooperative only**: it serializes importer instances using this same lock, but it does not serialize Curio/API processes or unrelated writers that do not take the lock.
+- Advisory-lock, serialization, and SQL failures are surfaced to the operator through `ON_ERROR_STOP=1` and checked subprocess execution. They are not automatically retried.
+- Insert SQL repeats conflict checks after acquiring the lock and aborts on an empty selection or count mismatch.
+- Each production run has a unique `run_id` and an audit manifest.
+- Database commands are launched as an argument vector rather than through a shell.
+- Batch and run labels accept 1-128 characters, including spaces, but reject CR, LF, NUL, `/`, and `\`. Stage-table names use a separate restricted SQL-identifier grammar and must begin with `audit_mk20_import_`.
+- The importer explicitly writes `market_mk20_deal.created_at = now()` to preserve the actual transaction timestamp in non-UTC sessions.
+
+Because unrelated Curio writers do not cooperate with the advisory lock, a clean staging result is not a guarantee that database state will remain unchanged before insertion. Operators must treat a surfaced transaction failure as a failed run and inspect state before retrying with a new run ID.
+
+## Public repository and secret hygiene
+
+Do not commit operational inputs or generated artifacts. They can expose CAR URLs, client addresses, CIDs, database locations, and generated SQL.
+
+Keep these out of the repository:
 
 - provider CSV files
 - allocation JSON files
 - `mk20-import-out/`
 - generated `*.sql`
 - generated `*.validated.csv`
-- shell history containing database credentials
-- log files
+- database credentials and shell history containing them
+- private keys, wallet files, API tokens, internal hostnames/IPs, and logs
 
-Use a local shell wrapper, `.pgpass`, environment variables, or your secret manager for DB access. Do not put passwords, private keys, API tokens, hostnames, or internal IP addresses into this repository.
-
-The included `.gitignore` is intentionally broad to reduce the chance of accidentally publishing runtime artifacts.
+Use a local wrapper, `.pgpass`, environment variables, or a secret manager for database access. The included `.gitignore` is intentionally broad.
 
 ## Required inputs
 
 ### Provider CSV
 
-The CSV must have exactly these columns:
+The CSV must have exactly these columns, in this order:
 
 ```text
 data_cid,piece_cid_v1,pcidv2,piece_size,car_size,car_url
 ```
 
-`piece_cid_v1` is the Filecoin allocation piece CID and must match the basename of `car_url` as `<piece_cid_v1>.car`.
-
-`pcidv2` is the FRC-0069 PieceCIDv2 stored in `market_mk20_deal.piece_cid_v2` and in `data.piece_cid`. The importer decodes it locally, converts its commitment root to PieceCIDv1, and derives its padded size. Both must exactly match `piece_cid_v1` and `piece_size`; no database connection is needed for this validation.
+`pcidv2` is the FRC-0069 PieceCIDv2 stored in `market_mk20_deal.piece_cid_v2` and `data.piece_cid`. `piece_cid_v1` is the Filecoin allocation piece CID. The CAR URL path must end with `<piece_cid_v1>.car`.
 
 ### Active allocations JSON
 
-The allocation JSON may be a root list, a root object keyed by allocation ID, or an `{"allocations": ...}` wrapper whose value is either a list or object. Records contain these fields, with common casing variants accepted:
+A recommended way to produce the allocation input is to query Lotus immediately before staging:
 
-- allocation id: `allocationid`, `allocation_id`, `ID`, or `id`
-- client actor id: `client` or `Client`
-- miner/provider actor id: `miner`, `provider`, or `Provider`
-- piece CID: `piececid`, `piece_cid`, `Data`, or `data`
-- piece size: `piecesize`, `piece_size`, `Size`, or `size`
-- term min/max: `termmin`, `term_min`, `TermMin`, `termmax`, `term_max`, `TermMax`
-- expiration: `expiration` or `Expiration`
+```bash
+lotus filplus list-allocations --json <client-address> > allocations.json
+```
 
-Fetch this from chain state immediately before staging so stale or already-consumed allocations are not used.
+The importer accepts all of these forms:
+
+- a top-level JSON list, including the direct output of the Lotus command above
+- `{"allocations": [...]}` or `{"Allocations": [...]}`
+- `{"allocations": {"123": {...}}}`, `{"Allocations": {"123": {...}}}`, and equivalent object forms
+- older flat mappings keyed by allocation ID
+
+For example, Lotus output in this form is accepted directly without conversion:
+
+```json
+[
+  {
+    "allocationid": 125422425,
+    "client": 3662041,
+    "expiration": 6429145,
+    "miner": 3199233,
+    "piececid": {
+      "/": "baga6ea4..."
+    },
+    "piecesize": 34359738368,
+    "termmax": 5256000,
+    "termmin": 518400
+  }
+]
+```
+
+Common field-name casing variants are accepted for allocation ID, client, miner/provider, piece CID, piece size, term bounds, and expiration. Object mappings may supply the allocation ID as the mapping key.
+
+Fetch allocations from current chain state immediately before staging. The importer trusts the supplied JSON; it does not query or refresh chain state itself.
+
+## File-side validation
+
+Before any database operation, the importer validates the CLI configuration, allocation JSON, and every CSV row.
+
+CLI and allocation validation includes:
+
+- `--client-id` and `--provider-id` must be positive.
+- `--provider` must be an `f0...` or `t0...` ID address whose encoded actor ID equals `--provider-id`.
+- `--piece-size` must be a positive power of two.
+- `--duration` must be positive.
+- `--limit`, when present, must be positive.
+- `--no-db --execute` is rejected.
+- Every allocation ID must be positive.
+- Allocation lookup is restricted to the requested client, provider/miner, and piece size.
+- Each CSV piece must resolve to exactly one matching allocation in the supplied allocation JSON.
+- The CSV piece CID and allocation piece CID must match.
+- Deal duration must be within the allocation's valid `term_min` / `term_max` range, and an invalid allocation term range is rejected.
+
+Piece and source validation includes:
+
+- PieceCIDv2 must be a canonical lowercase base32 CIDv1.
+- It must use the raw codec and the PieceCIDv2 multihash.
+- Its digest, tree height, commitment root, and encoded lengths must be structurally valid.
+- It is decoded and its commitment root is converted to PieceCIDv1.
+- The derived PieceCIDv1 must equal CSV `piece_cid_v1`.
+- Its derived padded size must equal CSV `piece_size`.
+- Padding validation mirrors `go-fil-commcid`: padding must be strictly less than half of the unpadded tree capacity.
+- CSV `piece_size` must also equal the configured `--piece-size`.
+- `car_size` must be positive.
+- `car_url` must be an absolute HTTP(S) URL, include a hostname, contain no embedded username/password, and have the exact `<piece_cid_v1>.car` basename.
+- `data_cid`, PieceCIDv1, PieceCIDv2, and CAR URL must be non-empty.
+- Duplicate CSV PieceCIDv1 values, PieceCIDv2 values, and resolved allocation IDs are rejected for all affected rows in the batch.
+
+The importer intentionally does **not** require `car_size` to equal the PieceCIDv2 raw payload size. Those values describe different input properties and equality is not enforced.
+
+## DB-side conflict checks
+
+DB staging marks file-valid rows invalid when relevant current state already exists. Checks cover:
+
+- deal ID and allocation ID conflicts
+- same-provider PieceCID conflicts in `market_mk20_deal` and the waiting/download/MK20 pipelines
+- waiting-queue, download-pipeline, and MK20-pipeline participation
+- `sectors_sdr_initial_pieces` matches by provider plus PieceCIDv1, PieceCIDv2, direct activation manifest CID, or verified allocation ID
+
+Piece duplicates are provider-scoped so replicas for different providers are not rejected solely because they share a piece. Allocation ID conflicts are global.
 
 ## Identity fields
 
-These are deliberately separate:
+These values are intentionally separate:
 
-- `--deal-client`: MK20 deal client address string stored in `market_mk20_deal.client`; usually the public wallet address that would have been used as `sptool --wallet`.
-- `--client-id`: numeric DataCap allocation client actor id used for allocation validation.
-- `--provider`: provider/miner Filecoin ID address (`f0...` or `t0...`) stored in DDO JSON.
-- `--provider-id`: numeric provider/miner actor id used for allocation and sector-table validation. It must equal the actor ID encoded by `--provider` (for example, `f03199233` pairs with `3199233`).
+- `--deal-client`: the public MK20 deal-client address stored in `market_mk20_deal.client`; commonly the address that would be supplied to `sptool --wallet`
+- `--client-id`: numeric DataCap allocation client actor ID used for allocation validation
+- `--provider`: provider/miner Filecoin ID address (`f0...` or `t0...`) stored in DDO JSON
+- `--provider-id`: numeric provider/miner actor ID; it must equal the ID encoded by `--provider` (for example, `f03199233` pairs with `3199233`)
 
-Do not pass a private key. Do not pass a wallet file.
+Do not pass a private key or wallet file.
 
-## Recommended workflow
+## Recommended operating workflow
 
-Set local variables in your shell. Use placeholder values below; do not commit your real values.
+Use placeholders and local secret handling:
 
 ```bash
 SCRIPT=./mk20_db_importer.py
 CSV=/path/to/provider-deals.csv
-ALLOC=/path/to/active-allocations.json
+ALLOC=/path/to/allocations.json
 
 BATCH_NAME=my-batch-name
 DEAL_CLIENT=<public-client-wallet-address>
 ALLOCATION_CLIENT_ID=<numeric-client-actor-id>
-PROVIDER=<provider-address>
+PROVIDER=<provider-ID-address>
 PROVIDER_ID=<numeric-provider-actor-id>
 PIECE_SIZE=34359738368
 DURATION=5256000
 
-# Prefer a local wrapper script or .pgpass. Do not commit credentials.
-YSQL_CURIO='/path/to/ysqlsh -h <db-host> -p <db-port> -U <db-user> -d <db-name>'
+YSQL_CURIO='ysqlsh ...'
 ```
 
 ### 1. File-only validation
 
-This does not connect to DB.
+This command does not connect to the database. It validates the complete input and generates artifacts. `--limit 1` scopes the generated insert SQL to the planned canary; it does not limit validation.
 
 ```bash
-python3 "$SCRIPT" \
-  --allocations "$ALLOC" \
-  --csv "$CSV" \
-  --batch-name "$BATCH_NAME" \
-  --out-dir mk20-import-out \
-  --provider "$PROVIDER" \
-  --provider-id "$PROVIDER_ID" \
-  --deal-client "$DEAL_CLIENT" \
-  --client-id "$ALLOCATION_CLIENT_ID" \
-  --piece-size "$PIECE_SIZE" \
-  --duration "$DURATION" \
-  --replace-stage \
-  --no-db
-```
-
-Review the file validation summary. Missing active allocations and duplicate active allocations are rejected.
-
-### 2. DB dry-run staging
-
-This loads `audit_mk20_import_stage` and performs DB-side duplicate checks. It does not insert production deal rows.
-
-```bash
-RUN_ID="${BATCH_NAME}_dryrun_$(date +%Y%m%d_%H%M%S)"
+RUN_ID="${BATCH_NAME}_filecheck_$(date +%Y%m%d_%H%M%S)"
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -153,18 +214,39 @@ python3 "$SCRIPT" \
   --piece-size "$PIECE_SIZE" \
   --duration "$DURATION" \
   --replace-stage \
+  --limit 1 \
+  --no-db
+```
+
+Review the summary and validated CSV. Production tables are untouched. Do not manually execute the generated insert SQL merely because it came from a `--no-db` run.
+
+### 2. DB staging / dry run
+
+Omit both `--no-db` and `--execute`. This runs the stage SQL, loads `audit_mk20_import_stage`, and evaluates current DB conflicts without inserting production MK20 rows.
+
+```bash
+RUN_ID="${BATCH_NAME}_dbcheck_$(date +%Y%m%d_%H%M%S)"
+
+python3 "$SCRIPT" \
+  --allocations "$ALLOC" \
+  --csv "$CSV" \
+  --batch-name "$BATCH_NAME" \
+  --run-id "$RUN_ID" \
+  --out-dir mk20-import-out \
+  --provider "$PROVIDER" \
+  --provider-id "$PROVIDER_ID" \
+  --deal-client "$DEAL_CLIENT" \
+  --client-id "$ALLOCATION_CLIENT_ID" \
+  --piece-size "$PIECE_SIZE" \
+  --duration "$DURATION" \
+  --replace-stage \
+  --limit 1 \
   --psql-cmd "$YSQL_CURIO"
 ```
 
-If an old stage table schema exists from a previous script version, rerun once with:
+If the stage table predates the current schema, rerun once with `--reset-stage-table`. That flag is restricted to an `audit_mk20_import_*` table; it does not target production MK20 tables.
 
-```bash
-  --reset-stage-table
-```
-
-Only use `--reset-stage-table` for the staging/audit stage table; it does not touch production MK20 tables.
-
-### 3. Review staging summary
+### 3. Review staging results
 
 ```bash
 $YSQL_CURIO -c "
@@ -185,11 +267,11 @@ ORDER BY count DESC, reason;
 "
 ```
 
-The `valid` rows are candidates not currently known to Curio by deal id, piece CID, allocation id, waiting queue, download pipeline, MK20 pipeline, or SDR initial pieces.
+Only rows with `valid = TRUE` are eligible for production selection. Insert SQL repeats the conflict predicate inside the production transaction.
 
-### 4. Create a backup/snapshot before production insert
+### 4. Create a backup or snapshot
 
-External dumps are best when you have a version-compatible client. If that is not available, create short-name DB-internal snapshots before production insert. Keep names short to avoid PostgreSQL's identifier-length truncation.
+Create a version-compatible external backup or operator-approved internal snapshot before production insertion. The following is an example for a Curio schema search path; adapt schema names to the deployment. Keep identifiers short to avoid PostgreSQL's 63-byte identifier truncation.
 
 ```bash
 BTAG="b$(date +%m%d_%H%M%S)"
@@ -218,12 +300,12 @@ SELECT '${BTAG}' AS backup_tag;
 SQL
 ```
 
-### 5. PoC insert
+### 5. Execute a one-row production canary
 
-Start with a very small insert.
+Use a new run ID and insert one row:
 
 ```bash
-RUN_ID="${BATCH_NAME}_poc10_$(date +%Y%m%d_%H%M%S)"
+RUN_ID="${BATCH_NAME}_canary1_$(date +%Y%m%d_%H%M%S)"
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -241,7 +323,7 @@ python3 "$SCRIPT" \
   --psql-cmd "$YSQL_CURIO" \
   --execute \
   --ack-db-direct \
-  --limit 10
+  --limit 1
 ```
 
 Verify immediately:
@@ -250,32 +332,45 @@ Verify immediately:
 $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.verify.sql"
 ```
 
-All problem queries must return zero rows.
+Within the run manifest, `expected_rows`, `inserted_deals`, and `inserted_waiting` must agree. `inserted_audit_count` and `deal_rows` should match the inserted run.
 
-Observe movement:
+`waiting_rows`, `download_pipeline_rows`, and `mk20_pipeline_rows` are live pipeline observations. They may differ as Curio consumes waiting rows and moves imported deals through the pipeline, including immediately after insertion.
+
+Every problem query must return zero rows.
+
+Then observe progression:
 
 ```bash
 $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.observe.sql"
 ```
 
-Expected path:
+Expected downstream progression is:
 
 ```text
 market_mk20_pipeline_waiting
   -> market_mk20_download_pipeline / market_mk20_pipeline
-  -> sectors_sdr_initial_pieces after Curio scheduling progresses
+  -> sectors_sdr_initial_pieces
 ```
 
-Backpressure or custom Curio limiters may leave rows in waiting for a while. That is not an importer failure if verify is clean.
+Temporary waiting caused by Curio scheduling, backpressure, or configured limiters is not automatically an importer failure when verification is otherwise clean. Confirm expected progress and operational health before scaling.
 
-### 6. Scale up gradually
+### 6. Scale gradually
 
-After the PoC reaches the expected downstream path, scale by chunks. Each run restages the CSV and excludes rows already inserted by previous runs.
+No fixed chunk size is universally safe. Choose it from current queue depth, download capacity, sealing throughput, allocation deadlines, failure rate, and message-submission health.
 
-Example 100-row run:
+A conservative progression is:
+
+1. 1-row canary
+2. 10 or 100 rows
+3. 500, 1000, or another operator-selected chunk
+4. the full remainder only after prior runs verify clean and show acceptable progression
+
+For each chunk, use a new `--run-id`, run the importer with the selected positive `--limit`, then run that run's `verify.sql` and `observe.sql`.
+
+Example 100-row step:
 
 ```bash
-RUN_ID="${BATCH_NAME}_real_100_$(date +%Y%m%d_%H%M%S)"
+RUN_ID="${BATCH_NAME}_chunk100_$(date +%Y%m%d_%H%M%S)"
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -296,11 +391,10 @@ python3 "$SCRIPT" \
   --limit 100
 
 $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.verify.sql"
+$YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.observe.sql"
 ```
 
-Repeat with `--limit 500`, `--limit 1000`, or another size appropriate for your waiting-queue and pipeline capacity.
-
-For the final remainder, only after smaller chunks verify clean:
+For the full valid remainder, omit `--limit` and explicitly add `--allow-full-batch`:
 
 ```bash
 RUN_ID="${BATCH_NAME}_remaining_$(date +%Y%m%d_%H%M%S)"
@@ -322,13 +416,38 @@ python3 "$SCRIPT" \
   --execute \
   --ack-db-direct \
   --allow-full-batch
-
-$YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.verify.sql"
 ```
 
-## Duplicate checks
+Use that mode only when processing the entire currently valid remainder is intentional. Verify and observe the full-remainder run just as you would any chunk:
 
-The generated verify SQL checks duplicate participation for the current run. To check all importer-created rows for a batch:
+```bash
+$YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.verify.sql"
+$YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.observe.sql"
+```
+
+## Capacity and deadline planning
+
+These are different constraints:
+
+- **Allocation expiration** is the chain epoch by which the allocation must be successfully claimed through sector activation.
+- **Deal duration** must satisfy the allocation's `term_min` and `term_max`; it is not the remaining time until allocation expiration.
+- **Local sealing completion** means local PC1/PC2/C2 work has progressed, but it does not prove that the allocation was claimed.
+- **Successful on-chain sector activation / allocation claim** requires the relevant chain message to land successfully before allocation expiration.
+
+Merely finishing local PC1/PC2/C2 work is not sufficient. Plan from current chain epoch to each allocation's expiration using actual sustained throughput and a substantial reserve for download delays, queue/backpressure, failed sectors, retries, message batching, and on-chain submission failures.
+
+Illustrative capacity calculation only:
+
+- 32,109 × 32 GiB ≈ 1003.4 TiB
+- at approximately 48 TiB/day of sustained sealing throughput, raw processing time is approximately 20.9 days
+
+The 48 TiB/day figure is an example assumption, not importer performance and not guaranteed throughput. Do not adopt a fixed “X days before expiration is safe” rule. Recalculate from current chain epoch, the relevant allocation expirations, observed end-to-end throughput, and an operator-selected safety margin.
+
+## Verification and duplicate checks
+
+Each production run's `verify.sql` checks audit/deal/waiting counts, persisted client/provider/allocation/piece/URL values, same-provider PieceCIDv2 duplicates, and allocation-ID duplicates.
+
+To check importer-created rows across a batch:
 
 ```bash
 $YSQL_CURIO <<SQL
@@ -347,8 +466,10 @@ dup_piece AS (
 dup_alloc AS (
   SELECT d.ddo_v1 #>> '{ddo,allocation_id}' AS allocation_id
   FROM market_mk20_deal d
-  WHERE d.ddo_v1 #>> '{ddo,provider}' = '$PROVIDER'
-    AND d.ddo_v1 #>> '{ddo,allocation_id}' IS NOT NULL
+  WHERE d.ddo_v1 #>> '{ddo,allocation_id}' IN (
+    SELECT allocation_id::TEXT
+    FROM imported
+  )
   GROUP BY d.ddo_v1 #>> '{ddo,allocation_id}'
   HAVING COUNT(*) > 1
 )
@@ -369,19 +490,32 @@ LIMIT 50;
 SQL
 ```
 
-This should return zero rows for importer-created rows. Existing historical duplicates outside importer runs may still exist and should be assessed separately.
+This should return zero rows for importer-created records. Historical records outside importer manifests require separate assessment.
 
 ## Rollback
 
-Each production run generates a rollback SQL file. It is intended only for early-stage rollback before imported pieces reach SDR initial pieces.
+> **Early-stage recovery only:** automatic rollback is intended before imported pieces reach `sectors_sdr_initial_pieces`.
+
+Each production run generates a rollback file:
 
 ```bash
 $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.rollback.sql"
 ```
 
-If any imported row has reached `sectors_sdr_initial_pieces`, the rollback SQL refuses to run. At that point manual operational recovery is required.
+The rollback is anchored to `audit_mk20_import_inserted`. It deletes waiting, download, MK20 pipeline, and deal rows by audited deal ID. Before deletion, its sector blocker check identifies imported material for the same provider using, where applicable:
+
+- PieceCIDv1
+- PieceCIDv2
+- direct piece activation manifest CID
+- verified allocation ID
+
+It also refuses an empty audit manifest and preserves parked-piece references still used by another download pipeline.
+
+If any imported piece has reached `sectors_sdr_initial_pieces`, automatic rollback refuses to proceed. Manual operational recovery is then required. Audit rows are retained for traceability after a successful early rollback.
 
 ## Operational monitoring
+
+Use the generated `observe.sql` for a run-specific view. Broader queue monitoring can include:
 
 ```bash
 watch -n 30 "$YSQL_CURIO -c \"
@@ -398,21 +532,19 @@ FROM market_mk20_pipeline;
 \""
 ```
 
-## Cleanup guidance
-
-Keep these until the batch is fully sealed and audited:
+Keep these until the batch is sealed and audited:
 
 - `audit_mk20_import_runs`
 - `audit_mk20_import_inserted`
-- current `audit_mk20_import_stage`
-- backup snapshot tables
-- generated `verify.sql`, `observe.sql`, and `rollback.sql`
+- the relevant `audit_mk20_import_stage` rows
+- backup/snapshot data
+- generated validated CSV, verify, observe, and rollback files
 
-Temporary tables you intentionally created for manual queue isolation can be removed after restoration and verification. Do not delete audit manifest tables unless you no longer need traceability.
+Remove temporary operator-created snapshot or isolation tables only after restoration is no longer needed and results have been verified. Do not discard audit manifests while traceability is required.
 
-## Development
+## Development verification
 
-Run the complete dependency-free validation sequence with:
+Run the dependency-free checks with:
 
 ```bash
 python3 -m py_compile mk20_db_importer.py
@@ -421,12 +553,14 @@ python3 -m unittest -v
 git diff --check
 ```
 
-The PieceCID tests use the official FRC-0069/go-fil-commcid reference vectors for 508-byte, empty 32 GiB, and 1016-byte payloads. GitHub Actions runs the same compile, unit-test, and diff checks against the oldest and newest supported Python versions on every pull request and on pushes to `main` or `codex/**`.
+The PieceCID tests use official FRC-0069/`go-fil-commcid` reference vectors for 508-byte, empty 32 GiB, and 1016-byte payloads. GitHub Actions runs the same compile, unit-test, and diff checks on Python 3.9 and 3.13 for pull requests and pushes to `main` or `codex/**`.
 
 ## Limitations
 
-- This tool targets the Curio MK20 DDO schema verified for the current source flow and YugabyteDB v2025.1+ for transaction-level advisory locks. Reinspect Curio source and schema before using it with a new Curio or database version.
-- The advisory lock coordinates this importer only. Curio and other database writers do not acquire it; serializable conflicts are intentionally surfaced to the operator as failures rather than retried automatically.
-- It does not verify chain state directly. It trusts the provided active allocation JSON and validates it against CSV and current Curio DB state.
-- It does not manage Curio backpressure. Large imports can create large waiting queues if Curio intake is paused or rate-limited.
-- It does not replace normal Curio monitoring, logs, or operational judgment.
+- The importer targets the currently verified Curio MK20 DDO schema and YugabyteDB v2025.1+ advisory-lock path. Reinspect source and schema before using it with another Curio or database version.
+- The advisory lock coordinates cooperating importer instances only; it does not block unrelated Curio/API writers.
+- The importer does not query chain state, confirm current epoch, monitor allocation consumption, or prove on-chain activation. It trusts the supplied allocation JSON.
+- It records allocation expiration for audit output but does not reject a row based on current epoch or calculate deadline safety.
+- It does not enforce equality between CAR size and PieceCIDv2 raw payload size.
+- It does not manage Curio backpressure, sealing capacity, or on-chain message submission.
+- It does not replace normal Curio monitoring, backups, or operator judgment.
