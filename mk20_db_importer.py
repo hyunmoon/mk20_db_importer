@@ -224,8 +224,13 @@ def piece_cid_v2_info(piece_cid_v2: str) -> PieceCidV2Info:
     if padded_size > (1 << 63) - 1:
         raise ValueError("PieceCIDv2 padded size exceeds signed BIGINT range")
     unpadded_capacity = padded_size * 127 // 128
-    if padding > unpadded_capacity:
-        raise ValueError("PieceCIDv2 padding exceeds unpadded piece capacity")
+    half_unpadded_capacity = unpadded_capacity >> 1
+    # Match go-fil-commcid PieceCidV2ToDataCommitment exactly. Padding must
+    # describe the smaller half of the selected tree; equality is invalid.
+    if padding >= half_unpadded_capacity:
+        raise ValueError(
+            "PieceCIDv2 padding must be less than half the unpadded piece capacity"
+        )
     payload_size = unpadded_capacity - padding
 
     v1_bytes = b"".join(
@@ -368,9 +373,12 @@ def read_allocations(path: Path) -> List[Allocation]:
         expiration = get_any(rec, ["expiration", "Expiration"])
         piece_cid = norm_piececid(piececid)
         try:
+            allocation_id = int(aid)
+            if allocation_id <= 0:
+                raise ValueError("allocation_id must be positive")
             out.append(
                 Allocation(
-                    allocation_id=int(aid),
+                    allocation_id=allocation_id,
                     client=int(client),
                     miner=int(miner),
                     piece_cid=piece_cid,
@@ -1290,8 +1298,10 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
     if args.client_id <= 0 or args.provider_id <= 0:
         raise SystemExit("--client-id and --provider-id must be positive")
-    if args.piece_size <= 0 or args.duration <= 0:
-        raise SystemExit("--piece-size and --duration must be positive")
+    if args.piece_size <= 0 or args.piece_size & (args.piece_size - 1):
+        raise SystemExit("--piece-size must be a positive power of two")
+    if args.duration <= 0:
+        raise SystemExit("--duration must be positive")
     if args.limit is not None and args.limit <= 0:
         raise SystemExit("--limit must be a positive integer when specified")
     if args.no_db and args.execute:
