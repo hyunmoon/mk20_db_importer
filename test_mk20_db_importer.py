@@ -16,6 +16,7 @@ V1_EMPTY_32_GIB = "baga6ea4seaqao7s73y24kcutaosvacpdjgfe5pw76ooefnyqw4ynr3d2y6x2
 V2_EMPTY_32_GIB = "bafkzcibcaapao7s73y24kcutaosvacpdjgfe5pw76ooefnyqw4ynr3d2y6x2mpq"
 V1_1016 = "baga6ea4seaqn42av3szurbbscwuu3zjssvfwbpsvbjf6y3tukvlgl2nf5rha6pa"
 V2_1016 = "bafkzcibcaac542av3szurbbscwuu3zjssvfwbpsvbjf6y3tukvlgl2nf5rha6pa"
+V2_EXCESSIVE_PADDING = "bafkzcibdvqbaislnvygmtytf57s2abxiaytklxc4icpf2mkvye4yjsxwzdk47vqf"
 
 
 class ImporterSafetyTests(unittest.TestCase):
@@ -154,6 +155,12 @@ class ImporterSafetyTests(unittest.TestCase):
         self.assertEqual(1024, info.padded_size)
         self.assertEqual(5, info.tree_height)
 
+    def test_piece_cid_v2_rejects_padding_at_or_above_half_capacity(self):
+        # Padded size 512, unpadded capacity 508, half capacity 254,
+        # encoded padding 300. go-fil-commcid rejects 300 >= 254.
+        with self.assertRaisesRegex(ValueError, "less than half"):
+            importer.piece_cid_v2_info(V2_EXCESSIVE_PADDING)
+
     def test_normal_candidate_uses_valid_reference_piece_cids(self):
         candidate = self.candidates()[0]
         self.assertIsNone(candidate.file_reject_reason)
@@ -231,6 +238,12 @@ class ImporterSafetyTests(unittest.TestCase):
         )
         self.assertEqual([42], [allocation.allocation_id for allocation in allocations])
 
+    def test_nonpositive_allocation_id_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "allocation_id must be positive"):
+            self.parse_allocations(
+                {"allocations": [self.allocation_record(allocation_id=0)]}
+            )
+
     def test_duration_inside_allocation_range_is_valid(self):
         candidate = self.candidates(duration=200)[0]
         self.assertIsNone(candidate.file_reject_reason)
@@ -306,6 +319,15 @@ class ImporterSafetyTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 SystemExit, "--no-db cannot be combined with --execute"
+            ):
+                importer.main()
+
+    def test_non_power_of_two_piece_size_is_rejected_before_file_access(self):
+        with mock.patch.object(
+            importer.sys, "argv", self.cli_args("--piece-size", "513")
+        ):
+            with self.assertRaisesRegex(
+                SystemExit, "--piece-size must be a positive power of two"
             ):
                 importer.main()
 
