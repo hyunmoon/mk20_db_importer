@@ -18,8 +18,16 @@ jobs:
         python-version: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Compile importer
+        run: python3 -m py_compile mk20_db_importer.py
+      - name: Compile tests
+        run: python3 -m py_compile test_mk20_db_importer.py
       - name: Run regression tests
-        run: python -m unittest -v
+        run: python3 -m unittest -v
+      - name: Check diff whitespace
+        run: git diff --check origin/main...HEAD
