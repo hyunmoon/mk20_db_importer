@@ -414,7 +414,12 @@ python3 "$SCRIPT" \
   --allow-full-batch
 ```
 
-Use that mode only when processing the entire currently valid remainder is intentional.
+Use that mode only when processing the entire currently valid remainder is intentional. Verify and observe the full-remainder run just as you would any chunk:
+
+```bash
+$YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.verify.sql"
+$YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.observe.sql"
+```
 
 ## Capacity and deadline planning
 
