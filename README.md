@@ -6,7 +6,7 @@ It is intended for an operator who already has a provider CSV and a freshly fetc
 
 > **Production warning:** `--execute` bypasses Curio's normal API and sanitize path and writes directly to production tables. Treat it as an operator-controlled production action. Start with one row, verify it, observe downstream progress, and scale only after the result is clean.
 
-Because this direct-DB path bypasses Curio's normal StartEpoch validation, the importer must write an explicit allocation-derived StartEpoch for every valid candidate. A null StartEpoch is inappropriate for a large direct-DB batch: Curio would later resolve it to roughly the current chain head plus two days, concentrating thousands of deals around the same short activation deadline.
+Because this direct-DB path bypasses Curio's normal StartEpoch validation, the importer must write an explicit numeric StartEpoch for every valid candidate. It can use one operator-selected batch-wide epoch or derive an epoch from each allocation. A null StartEpoch is inappropriate for a large direct-DB batch: Curio would later resolve it to roughly the current chain head plus two days, concentrating thousands of deals around the same short activation deadline.
 
 ## What production insertion writes
 
@@ -19,7 +19,7 @@ This importer follows that initial shape. Curio's background pipeline consumes t
 
 A production run also creates or updates importer-owned audit data:
 
-- `audit_mk20_import_runs`, including the supplied chain-head snapshot and scheduling policy
+- `audit_mk20_import_runs`, including the supplied chain-head snapshot, nullable explicit StartEpoch, and fallback scheduling policy
 - `audit_mk20_import_inserted`, including each row's StartEpoch and allocation expiration
 
 ## Three execution levels
@@ -129,15 +129,38 @@ CHAIN_HEAD=$(lotus chain head --height)
 
 Pass it with required `--chain-head`. The importer does not invoke Lotus itself.
 
-For each candidate, after exactly one allocation has been matched, the default schedule is:
+The importer supports two scheduling modes.
+
+#### Explicit batch-wide StartEpoch
+
+Supply `--start-epoch` to give every valid candidate in the invocation exactly the same absolute chain epoch:
+
+```bash
+CHAIN_HEAD=$(lotus chain head --height)
+
+python3 mk20_db_importer.py \
+  ... \
+  --chain-head "$CHAIN_HEAD" \
+  --start-epoch 6427000
+```
+
+Every valid candidate in this run receives `StartEpoch = 6427000`. The value is not moved or clamped for an allocation that cannot safely use it; that candidate is rejected instead.
+
+`--start-epoch` takes precedence over `--start-before-allocation-expiration-epochs`. Supplying both is allowed. The fallback buffer is still recorded in the audit manifest for reproducibility, but it does not participate in the explicit-mode calculation.
+
+#### Allocation-derived fallback
+
+When `--start-epoch` is omitted, each candidate uses the expiration of its own matched allocation:
 
 ```text
 start_epoch = allocation.expiration - 1440
 ```
 
-Filecoin epochs are 30 seconds, so 1440 epochs is 12 hours. This is controlled by `--start-before-allocation-expiration-epochs`, whose default is `1440`. The candidate must also have at least `--expected-seal-runway-epochs` between the supplied chain head and StartEpoch; its default is `960` epochs, or 8 hours. Equality at the exact runway boundary is accepted.
+Filecoin epochs are 30 seconds, so 1440 epochs is 12 hours. This is controlled by `--start-before-allocation-expiration-epochs`, whose default is `1440`. Allocations with different expiration epochs may therefore produce different StartEpoch values.
 
-The value is derived independently from the exact allocation matched to each piece. It is not a batch-wide timestamp, and the requested DDO duration remains unchanged.
+For both modes, StartEpoch must be positive, must be at least `chain_head + expected_seal_runway_epochs`, and must be strictly less than that candidate's allocation expiration. The default expected sealing runway is `960` epochs, or 8 hours. Equality at the exact runway boundary is accepted; equality with allocation expiration is rejected.
+
+The requested DDO duration remains unchanged in both modes.
 
 StartEpoch is an activation deadline and safety value, **not** a throughput throttle. Setting it explicitly does not prevent a large import from creating substantial downstream download, CommP, aggregation, sealing, or message load. Curio-side release and backpressure remain separate operational concerns.
 
@@ -148,6 +171,7 @@ Before any database operation, the importer validates the CLI configuration, all
 CLI and allocation validation includes:
 
 - `--chain-head` is required and must be positive.
+- `--start-epoch`, when supplied, must be positive. It selects explicit batch-wide mode and takes precedence over the fallback buffer.
 - `--start-before-allocation-expiration-epochs` must be positive; its default is `1440`.
 - `--expected-seal-runway-epochs` must be positive; its default is `960`.
 - `--client-id` and `--provider-id` must be positive.
@@ -161,8 +185,8 @@ CLI and allocation validation includes:
 - Each CSV piece must resolve to exactly one matching allocation in the supplied allocation JSON.
 - The CSV piece CID and allocation piece CID must match.
 - Deal duration must be within the allocation's valid `term_min` / `term_max` range, and an invalid allocation term range is rejected.
-- Every uniquely matched allocation gets its own `start_epoch = allocation.expiration - start_before_allocation_expiration_epochs`.
-- A candidate is rejected if the derived StartEpoch is non-positive, is behind the supplied chain head, or is below `chain_head + expected_seal_runway_epochs`.
+- With `--start-epoch`, every uniquely matched candidate receives that exact batch-wide value. Without it, every candidate gets `start_epoch = allocation.expiration - start_before_allocation_expiration_epochs` from its own allocation.
+- A candidate is rejected if its selected StartEpoch is non-positive, is behind the supplied chain head, is below `chain_head + expected_seal_runway_epochs`, or is not strictly before its allocation expiration.
 
 Piece and source validation includes:
 
@@ -481,7 +505,7 @@ $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.obser
 These are different constraints:
 
 - **Allocation expiration** is the chain epoch by which the allocation must be successfully claimed through sector activation.
-- **DDO StartEpoch** is the explicit deal-start deadline carried in the imported DDO. By default, this importer places it 1440 epochs before that candidate's own allocation expiration and rejects candidates that lack the configured sealing runway from the supplied chain head.
+- **DDO StartEpoch** is the explicit deal-start deadline carried in the imported DDO. It is either the operator-supplied batch-wide `--start-epoch` or, by default, 1440 epochs before that candidate's own allocation expiration. Both modes reject candidates that lack the configured sealing runway or whose StartEpoch is not strictly before allocation expiration.
 - **Deal duration** must satisfy the allocation's `term_min` and `term_max`; it is not the remaining time until allocation expiration.
 - **Local sealing completion** means local PC1/PC2/C2 work has progressed, but it does not prove that the allocation was claimed.
 - **Successful on-chain sector activation / allocation claim** requires the relevant chain message to land successfully before allocation expiration.
@@ -501,7 +525,8 @@ Each production run's `verify.sql` checks audit/deal/waiting counts, persisted c
 
 - the numeric `ddo_v1.ddo.start_epoch` equals the per-row audited StartEpoch;
 - audited allocation expiration is greater than StartEpoch;
-- `alloc_expiration - start_epoch` equals the run's recorded `start_before_allocation_expiration_epochs`;
+- in explicit mode, every audited StartEpoch equals the run's nullable `explicit_start_epoch` mode marker;
+- in fallback mode, `alloc_expiration - start_epoch` equals the run's recorded `start_before_allocation_expiration_epochs`;
 - no audited StartEpoch is below the recorded `chain_head + expected_seal_runway_epochs`.
 
 All problem queries must return zero rows. The sample output includes both StartEpoch and allocation expiration for direct comparison.

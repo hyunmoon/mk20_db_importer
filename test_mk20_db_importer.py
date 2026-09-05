@@ -76,6 +76,7 @@ class ImporterSafetyTests(unittest.TestCase):
         chain_head=90000,
         start_before_allocation_expiration_epochs=importer.DEFAULT_START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS,
         expected_seal_runway_epochs=importer.DEFAULT_EXPECTED_SEAL_RUNWAY_EPOCHS,
+        explicit_start_epoch=None,
     ):
         rows = rows or [self.valid_row()]
         if allocations_by_piece is None:
@@ -100,6 +101,7 @@ class ImporterSafetyTests(unittest.TestCase):
                 chain_head,
                 start_before_allocation_expiration_epochs,
                 expected_seal_runway_epochs,
+                explicit_start_epoch,
             )
 
     def allocation_record(self, *, allocation_id=42):
@@ -310,6 +312,139 @@ class ImporterSafetyTests(unittest.TestCase):
         self.assertEqual([98560, 108560], [c.start_epoch for c in candidates])
         self.assertTrue(all(c.file_reject_reason is None for c in candidates))
 
+    def test_explicit_start_epoch_is_batch_wide_and_overrides_fallback_buffer(self):
+        rows = [
+            self.valid_row(),
+            self.valid_row(piece_cid_v1=V1_508_ALT, piece_cid_v2=V2_508_ALT),
+        ]
+        allocations = {
+            V1_508: [self.allocation(allocation_id=42, expiration=105000)],
+            V1_508_ALT: [
+                self.allocation(
+                    piece_cid=V1_508_ALT,
+                    allocation_id=43,
+                    expiration=115000,
+                )
+            ],
+        }
+
+        candidates = self.candidates(
+            rows=rows,
+            allocations_by_piece=allocations,
+            chain_head=97000,
+            explicit_start_epoch=100000,
+            start_before_allocation_expiration_epochs=2000,
+        )
+
+        self.assertEqual([100000, 100000], [c.start_epoch for c in candidates])
+        self.assertTrue(all(c.file_reject_reason is None for c in candidates))
+        for candidate in candidates:
+            with self.subTest(allocation_id=candidate.allocation_id):
+                ddo = json.loads(candidate.ddo_v1_json(self.PROVIDER, 200))
+                self.assertEqual(100000, ddo["ddo"]["start_epoch"])
+                self.assertIsInstance(ddo["ddo"]["start_epoch"], int)
+
+    def test_explicit_start_epoch_exact_runway_boundary_is_valid(self):
+        chain_head = 10000
+        runway = 960
+        candidate = self.candidates(
+            allocations_by_piece={
+                V1_508: [self.allocation(expiration=20000)]
+            },
+            chain_head=chain_head,
+            expected_seal_runway_epochs=runway,
+            explicit_start_epoch=chain_head + runway,
+        )[0]
+
+        self.assertEqual(chain_head + runway, candidate.start_epoch)
+        self.assertIsNone(candidate.file_reject_reason)
+
+    def test_explicit_start_epoch_one_below_runway_is_rejected(self):
+        chain_head = 10000
+        runway = 960
+        start_epoch = chain_head + runway - 1
+        candidate = self.candidates(
+            allocations_by_piece={
+                V1_508: [self.allocation(expiration=20000)]
+            },
+            chain_head=chain_head,
+            expected_seal_runway_epochs=runway,
+            explicit_start_epoch=start_epoch,
+        )[0]
+
+        self.assertEqual(start_epoch, candidate.start_epoch)
+        self.assertIn(
+            "insufficient sealing runway: "
+            f"start_epoch={start_epoch}, minimum_start_epoch={chain_head + runway}, "
+            f"chain_head={chain_head}, expected_seal_runway_epochs={runway}",
+            candidate.file_reject_reason,
+        )
+        self.assertIn("mode=explicit", candidate.file_reject_reason)
+
+    def test_explicit_start_epoch_must_precede_each_allocation_expiration(self):
+        start_epoch = 100000
+        for allocation_expiration, rejected in (
+            (start_epoch + 1, False),
+            (start_epoch, True),
+            (start_epoch - 1, True),
+        ):
+            with self.subTest(
+                allocation_expiration=allocation_expiration,
+                rejected=rejected,
+            ):
+                candidate = self.candidates(
+                    allocations_by_piece={
+                        V1_508: [
+                            self.allocation(expiration=allocation_expiration)
+                        ]
+                    },
+                    chain_head=90000,
+                    explicit_start_epoch=start_epoch,
+                )[0]
+
+                self.assertEqual(start_epoch, candidate.start_epoch)
+                if rejected:
+                    self.assertIn(
+                        "start epoch is not before allocation expiration: "
+                        f"start_epoch={start_epoch}, "
+                        f"allocation_expiration={allocation_expiration}",
+                        candidate.file_reject_reason,
+                    )
+                    self.assertIn("mode=explicit", candidate.file_reject_reason)
+                else:
+                    self.assertIsNone(candidate.file_reject_reason)
+
+    def test_explicit_start_epoch_rejects_only_the_unsafe_allocation(self):
+        rows = [
+            self.valid_row(),
+            self.valid_row(piece_cid_v1=V1_508_ALT, piece_cid_v2=V2_508_ALT),
+        ]
+        allocations = {
+            V1_508: [self.allocation(allocation_id=42, expiration=110000)],
+            V1_508_ALT: [
+                self.allocation(
+                    piece_cid=V1_508_ALT,
+                    allocation_id=43,
+                    expiration=99999,
+                )
+            ],
+        }
+
+        candidates = self.candidates(
+            rows=rows,
+            allocations_by_piece=allocations,
+            chain_head=90000,
+            explicit_start_epoch=100000,
+        )
+
+        self.assertIsNone(candidates[0].file_reject_reason)
+        self.assertEqual(100000, candidates[0].start_epoch)
+        self.assertEqual(100000, candidates[1].start_epoch)
+        self.assertIn(
+            "start epoch is not before allocation expiration",
+            candidates[1].file_reject_reason,
+        )
+
     def test_ddo_json_contains_numeric_nonnull_start_epoch(self):
         candidate = self.candidates()[0]
 
@@ -489,6 +624,20 @@ class ImporterSafetyTests(unittest.TestCase):
                     ):
                         importer.main()
 
+    def test_nonpositive_explicit_start_epoch_is_rejected_before_file_access(self):
+        for value in (0, -1):
+            with self.subTest(explicit_start_epoch=value):
+                with mock.patch.object(
+                    importer.sys,
+                    "argv",
+                    self.cli_args("--start-epoch", str(value)),
+                ):
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "--start-epoch must be positive when specified",
+                    ):
+                        importer.main()
+
     def test_no_db_execute_is_rejected_before_file_access(self):
         with mock.patch.object(
             importer.sys,
@@ -630,6 +779,7 @@ class ImporterSafetyTests(unittest.TestCase):
 
         for column in (
             "chain_head",
+            "explicit_start_epoch",
             "start_before_allocation_expiration_epochs",
             "expected_seal_runway_epochs",
         ):
@@ -639,11 +789,11 @@ class ImporterSafetyTests(unittest.TestCase):
             with self.subTest(inserted_column=column):
                 self.assertIn(f"ADD COLUMN IF NOT EXISTS {column} BIGINT", normalized)
         self.assertIn(
-            "run_id, batch_name, limit_rows, chain_head, "
+            "run_id, batch_name, limit_rows, chain_head, explicit_start_epoch, "
             "start_before_allocation_expiration_epochs, expected_seal_runway_epochs, notes",
             normalized,
         )
-        self.assertIn("'123456', '1440', '960'", normalized)
+        self.assertIn("'123456', NULL, '1440', '960'", normalized)
         self.assertIn(
             "piece_cid_v1, piece_cid_v2, allocation_id, start_epoch, alloc_expiration, car_url",
             normalized,
@@ -672,6 +822,39 @@ class ImporterSafetyTests(unittest.TestCase):
         )
         self.assertIn("(s.start_epoch >= 123456 + 960) IS NOT TRUE", sql)
 
+    def test_explicit_insert_sql_persists_and_enforces_only_explicit_policy(self):
+        sql = importer.generate_insert_sql(
+            "batch",
+            "audit_mk20_import_stage",
+            10,
+            "run",
+            123456,
+            1440,
+            960,
+            200000,
+        )
+        normalized = " ".join(sql.split())
+
+        self.assertIn("'123456', 200000, '1440', '960'", normalized)
+        self.assertIn("s.start_epoch IS DISTINCT FROM 200000", sql)
+        self.assertNotIn(
+            "s.alloc_expiration - s.start_epoch = 1440",
+            sql,
+        )
+        self.assertIn("(s.alloc_expiration > s.start_epoch) IS NOT TRUE", sql)
+        self.assertIn("(s.start_epoch >= 123456 + 960) IS NOT TRUE", sql)
+
+    def test_fallback_insert_sql_retains_allocation_buffer_policy(self):
+        sql = importer.generate_insert_sql(
+            "batch", "audit_mk20_import_stage", 10, "run", 123456, 1440, 960
+        )
+
+        self.assertIn(
+            "(s.alloc_expiration - s.start_epoch = 1440) IS NOT TRUE",
+            sql,
+        )
+        self.assertNotIn("s.start_epoch IS DISTINCT FROM 200000", sql)
+
     def test_verify_sql_scopes_piece_duplicates_to_provider(self):
         sql = importer.generate_verify_sql(
             "batch", "audit_mk20_import_stage", "run"
@@ -692,6 +875,7 @@ class ImporterSafetyTests(unittest.TestCase):
             "bad_ddo_start_epoch",
             "bad_allocation_start_order",
             "bad_allocation_start_buffer",
+            "bad_explicit_start_epoch",
             "insufficient_audited_start_runway",
         ):
             with self.subTest(problem=problem):
@@ -704,6 +888,12 @@ class ImporterSafetyTests(unittest.TestCase):
         self.assertIn("i.alloc_expiration <= i.start_epoch", sql)
         self.assertIn(
             "IS DISTINCT FROM r.start_before_allocation_expiration_epochs",
+            sql,
+        )
+        self.assertIn("r.explicit_start_epoch IS NULL", sql)
+        self.assertIn("r.explicit_start_epoch IS NOT NULL", sql)
+        self.assertIn(
+            "i.start_epoch IS DISTINCT FROM r.explicit_start_epoch",
             sql,
         )
         self.assertIn(
@@ -748,6 +938,7 @@ class ImporterSafetyTests(unittest.TestCase):
 
         self.assertIn("SELECT 'run_policy' AS section", sql)
         self.assertIn("chain_head", sql)
+        self.assertIn("explicit_start_epoch", sql)
         self.assertIn("start_before_allocation_expiration_epochs", sql)
         self.assertIn("expected_seal_runway_epochs", sql)
         self.assertIn("i.start_epoch, i.alloc_expiration", sql)
