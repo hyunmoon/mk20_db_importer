@@ -39,9 +39,11 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-VERSION = "2026-09-01-production-safety-hardening"
+VERSION = "2026-09-06-explicit-start-epoch-override"
 EXPECTED_CSV_COLUMNS = ["data_cid", "piece_cid_v1", "pcidv2", "piece_size", "car_size", "car_url"]
 STAGE_TABLE_PREFIX = "audit_mk20_import_"
+DEFAULT_START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS = 1440
+DEFAULT_EXPECTED_SEAL_RUNWAY_EPOCHS = 960
 CID_VERSION = 1
 RAW_CODEC = 0x55
 FIL_COMMITMENT_UNSEALED_CODEC = 0xF101
@@ -278,6 +280,7 @@ class Candidate:
     alloc_term_min: Optional[int] = None
     alloc_term_max: Optional[int] = None
     alloc_expiration: Optional[int] = None
+    start_epoch: Optional[int] = None
     file_reject_reason: Optional[str] = None
 
     def data_json(self) -> str:
@@ -301,7 +304,7 @@ class Candidate:
                 "ddo": {
                     "duration": duration,
                     "provider": provider,
-                    "start_epoch": None,
+                    "start_epoch": self.start_epoch,
                     "allocation_id": self.allocation_id,
                     "market_address": "",
                     "market_deal_id": None,
@@ -321,6 +324,52 @@ class Candidate:
             separators=(",", ":"),
             sort_keys=False,
         )
+
+
+def select_start_epoch(
+    allocation_expiration: int,
+    chain_head: int,
+    explicit_start_epoch: Optional[int],
+    start_before_allocation_expiration_epochs: int,
+    expected_seal_runway_epochs: int,
+) -> tuple[int, Optional[str]]:
+    mode = "explicit" if explicit_start_epoch is not None else "allocation-derived"
+    start_epoch = (
+        explicit_start_epoch
+        if explicit_start_epoch is not None
+        else allocation_expiration - start_before_allocation_expiration_epochs
+    )
+    if start_epoch <= 0:
+        return start_epoch, (
+            f"{mode} start epoch is non-positive: "
+            f"start_epoch={start_epoch}, allocation_expiration={allocation_expiration}, "
+            "start_before_allocation_expiration_epochs="
+            f"{start_before_allocation_expiration_epochs}"
+        )
+
+    minimum_start_epoch = chain_head + expected_seal_runway_epochs
+    if start_epoch < chain_head:
+        return start_epoch, (
+            f"{mode} start epoch is in the past: "
+            f"start_epoch={start_epoch}, chain_head={chain_head}, "
+            f"minimum_start_epoch={minimum_start_epoch}, "
+            f"expected_seal_runway_epochs={expected_seal_runway_epochs}"
+        )
+    if start_epoch < minimum_start_epoch:
+        return start_epoch, (
+            "insufficient sealing runway: "
+            f"start_epoch={start_epoch}, minimum_start_epoch={minimum_start_epoch}, "
+            f"chain_head={chain_head}, "
+            f"expected_seal_runway_epochs={expected_seal_runway_epochs}, "
+            f"mode={mode}"
+        )
+    if start_epoch >= allocation_expiration:
+        return start_epoch, (
+            "start epoch is not before allocation expiration: "
+            f"start_epoch={start_epoch}, allocation_expiration={allocation_expiration}, "
+            f"mode={mode}"
+        )
+    return start_epoch, None
 
 
 def read_allocations(path: Path) -> List[Allocation]:
@@ -424,6 +473,10 @@ def read_csv_candidates(
     provider_id: int,
     piece_size_expected: int,
     duration: int,
+    chain_head: int,
+    start_before_allocation_expiration_epochs: int,
+    expected_seal_runway_epochs: int,
+    explicit_start_epoch: Optional[int] = None,
 ) -> List[Candidate]:
     out: List[Candidate] = []
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -502,6 +555,15 @@ def read_csv_candidates(
                 c.alloc_term_min = a.term_min
                 c.alloc_term_max = a.term_max
                 c.alloc_expiration = a.expiration
+                c.start_epoch, scheduling_error = select_start_epoch(
+                    a.expiration,
+                    chain_head,
+                    explicit_start_epoch,
+                    start_before_allocation_expiration_epochs,
+                    expected_seal_runway_epochs,
+                )
+                if scheduling_error:
+                    reasons.append(scheduling_error)
                 if a.client != client_id:
                     reasons.append(f"allocation client mismatch: {a.client} != {client_id}")
                 if a.miner != provider_id:
@@ -561,7 +623,7 @@ def write_candidates_csv(path: Path, candidates: List[Candidate], provider: str,
         fieldnames = [
             "csv_row_no", "deal_id", "deal_client", "allocation_client_id", "provider", "provider_id", "duration",
             "data_cid", "piece_cid_v1", "piece_cid_v2", "piece_size", "car_size", "car_url",
-            "allocation_id", "alloc_term_min", "alloc_term_max", "alloc_expiration", "file_reject_reason",
+            "allocation_id", "alloc_term_min", "alloc_term_max", "alloc_expiration", "start_epoch", "file_reject_reason",
             "data_json", "ddo_v1_json", "retrieval_v1_json", "pdp_v1_json",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -586,6 +648,7 @@ def write_candidates_csv(path: Path, candidates: List[Candidate], provider: str,
                     "alloc_term_min": c.alloc_term_min if c.alloc_term_min is not None else "\\N",
                     "alloc_term_max": c.alloc_term_max if c.alloc_term_max is not None else "\\N",
                     "alloc_expiration": c.alloc_expiration if c.alloc_expiration is not None else "\\N",
+                    "start_epoch": c.start_epoch if c.start_epoch is not None else "\\N",
                     "file_reject_reason": c.file_reject_reason or "\\N",
                     "data_json": c.data_json(),
                     "ddo_v1_json": c.ddo_v1_json(provider, duration),
@@ -688,6 +751,7 @@ CREATE TABLE IF NOT EXISTS {stage_table} (
   alloc_term_min BIGINT,
   alloc_term_max BIGINT,
   alloc_expiration BIGINT,
+  start_epoch BIGINT,
   file_reject_reason TEXT,
   db_reject_reason TEXT,
   valid BOOLEAN NOT NULL DEFAULT FALSE,
@@ -698,6 +762,9 @@ CREATE TABLE IF NOT EXISTS {stage_table} (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (batch_name, csv_row_no)
 );
+
+ALTER TABLE {stage_table}
+  ADD COLUMN IF NOT EXISTS start_epoch BIGINT;
 
 {delete_sql}
 
@@ -719,6 +786,7 @@ CREATE TEMP TABLE mk20_import_tmp (
   alloc_term_min BIGINT,
   alloc_term_max BIGINT,
   alloc_expiration BIGINT,
+  start_epoch BIGINT,
   file_reject_reason TEXT,
   data_json JSONB,
   ddo_v1_json JSONB,
@@ -726,18 +794,18 @@ CREATE TEMP TABLE mk20_import_tmp (
   pdp_v1_json JSONB
 ) ON COMMIT DROP;
 
-\\copy mk20_import_tmp (csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id, duration, data_cid, piece_cid_v1, piece_cid_v2, piece_size, car_size, car_url, allocation_id, alloc_term_min, alloc_term_max, alloc_expiration, file_reject_reason, data_json, ddo_v1_json, retrieval_v1_json, pdp_v1_json) FROM {sql_literal(csv_path)} WITH (FORMAT csv, HEADER true, NULL '\\N')
+\\copy mk20_import_tmp (csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id, duration, data_cid, piece_cid_v1, piece_cid_v2, piece_size, car_size, car_url, allocation_id, alloc_term_min, alloc_term_max, alloc_expiration, start_epoch, file_reject_reason, data_json, ddo_v1_json, retrieval_v1_json, pdp_v1_json) FROM {sql_literal(csv_path)} WITH (FORMAT csv, HEADER true, NULL '\\N')
 
 INSERT INTO {stage_table} (
   batch_name, csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id, duration,
   data_cid, piece_cid_v1, piece_cid_v2, piece_size, car_size, car_url,
-  allocation_id, alloc_term_min, alloc_term_max, alloc_expiration,
+  allocation_id, alloc_term_min, alloc_term_max, alloc_expiration, start_epoch,
   file_reject_reason, data_json, ddo_v1_json, retrieval_v1_json, pdp_v1_json
 )
 SELECT
   {sql_literal(batch_name)}, csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id, duration,
   data_cid, piece_cid_v1, piece_cid_v2, piece_size, car_size, car_url,
-  allocation_id, alloc_term_min, alloc_term_max, alloc_expiration,
+  allocation_id, alloc_term_min, alloc_term_max, alloc_expiration, start_epoch,
   file_reject_reason, data_json, ddo_v1_json, retrieval_v1_json, pdp_v1_json
 FROM mk20_import_tmp;
 
@@ -879,7 +947,8 @@ WHERE batch_name = {sql_literal(batch_name)}
 GROUP BY 1, 2
 ORDER BY count DESC, reason;
 
-SELECT 'valid_sample' AS section, csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id, piece_cid_v1, piece_cid_v2, allocation_id, car_url
+SELECT 'valid_sample' AS section, csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id,
+       piece_cid_v1, piece_cid_v2, allocation_id, alloc_expiration, start_epoch, car_url
 FROM {stage_table}
 WHERE batch_name = {sql_literal(batch_name)} AND valid
 ORDER BY csv_row_no
@@ -887,7 +956,16 @@ LIMIT 20;
 """
 
 
-def generate_insert_sql(batch_name: str, stage_table: str, limit: Optional[int], run_id: str) -> str:
+def generate_insert_sql(
+    batch_name: str,
+    stage_table: str,
+    limit: Optional[int],
+    run_id: str,
+    chain_head: int,
+    start_before_allocation_expiration_epochs: int,
+    expected_seal_runway_epochs: int,
+    explicit_start_epoch: Optional[int] = None,
+) -> str:
     stage_table = validate_stage_table(stage_table)
     limit_clause = f"LIMIT {int(limit)}" if limit is not None and limit > 0 else ""
     empty_pick_message = sql_literal(
@@ -896,6 +974,21 @@ def generate_insert_sql(batch_name: str, stage_table: str, limit: Optional[int],
     count_mismatch_message = sql_literal(
         f"Insert count mismatch for run_id={run_id}: picked %, deal %, waiting %"
     )
+    scheduling_mismatch_message = sql_literal(
+        f"Unsafe StartEpoch scheduling metadata for run_id={run_id}; rerun file validation and staging"
+    )
+    explicit_start_epoch_sql = (
+        "NULL" if explicit_start_epoch is None else str(int(explicit_start_epoch))
+    )
+    if explicit_start_epoch is None:
+        scheduling_policy_guard = (
+            "       OR (s.alloc_expiration - s.start_epoch = "
+            f"{int(start_before_allocation_expiration_epochs)}) IS NOT TRUE"
+        )
+    else:
+        scheduling_policy_guard = (
+            f"       OR s.start_epoch IS DISTINCT FROM {int(explicit_start_epoch)}"
+        )
     return f"""
 BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 
@@ -911,8 +1004,21 @@ CREATE TABLE IF NOT EXISTS audit_mk20_import_runs (
   expected_rows BIGINT,
   inserted_deals BIGINT,
   inserted_waiting BIGINT,
+  chain_head BIGINT,
+  explicit_start_epoch BIGINT,
+  start_before_allocation_expiration_epochs BIGINT,
+  expected_seal_runway_epochs BIGINT,
   notes TEXT
 );
+
+ALTER TABLE audit_mk20_import_runs
+  ADD COLUMN IF NOT EXISTS chain_head BIGINT;
+ALTER TABLE audit_mk20_import_runs
+  ADD COLUMN IF NOT EXISTS explicit_start_epoch BIGINT;
+ALTER TABLE audit_mk20_import_runs
+  ADD COLUMN IF NOT EXISTS start_before_allocation_expiration_epochs BIGINT;
+ALTER TABLE audit_mk20_import_runs
+  ADD COLUMN IF NOT EXISTS expected_seal_runway_epochs BIGINT;
 
 CREATE TABLE IF NOT EXISTS audit_mk20_import_inserted (
   run_id TEXT NOT NULL,
@@ -926,14 +1032,29 @@ CREATE TABLE IF NOT EXISTS audit_mk20_import_inserted (
   piece_cid_v1 TEXT NOT NULL,
   piece_cid_v2 TEXT NOT NULL,
   allocation_id BIGINT NOT NULL,
+  start_epoch BIGINT,
+  alloc_expiration BIGINT,
   car_url TEXT NOT NULL,
   inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (run_id, deal_id)
 );
 
+ALTER TABLE audit_mk20_import_inserted
+  ADD COLUMN IF NOT EXISTS start_epoch BIGINT;
+ALTER TABLE audit_mk20_import_inserted
+  ADD COLUMN IF NOT EXISTS alloc_expiration BIGINT;
+
 -- Refuse run_id reuse. If this fails, choose a new --run-id.
-INSERT INTO audit_mk20_import_runs (run_id, batch_name, limit_rows, notes)
-VALUES ({sql_literal(run_id)}, {sql_literal(batch_name)}, {sql_literal(limit) if limit else 'NULL'}, {sql_literal('mk20 db importer ' + VERSION)});
+INSERT INTO audit_mk20_import_runs (
+  run_id, batch_name, limit_rows, chain_head, explicit_start_epoch,
+  start_before_allocation_expiration_epochs, expected_seal_runway_epochs, notes
+)
+VALUES (
+  {sql_literal(run_id)}, {sql_literal(batch_name)}, {sql_literal(limit) if limit else 'NULL'},
+  {sql_literal(chain_head)}, {explicit_start_epoch_sql},
+  {sql_literal(start_before_allocation_expiration_epochs)},
+  {sql_literal(expected_seal_runway_epochs)}, {sql_literal('mk20 db importer ' + VERSION)}
+);
 
 CREATE TEMP TABLE picked AS
 SELECT *
@@ -951,6 +1072,24 @@ BEGIN
   SELECT COUNT(*) INTO n FROM picked;
   IF n = 0 THEN
     RAISE EXCEPTION {empty_pick_message};
+  END IF;
+END $$;
+
+-- Fail closed if an older or modified stage row does not match this run's
+-- supplied scheduling snapshot and policy. Verification after commit is not
+-- a substitute for this pre-insert guard.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM picked s
+    WHERE jsonb_typeof(s.ddo_v1_json #> '{{ddo,start_epoch}}') IS DISTINCT FROM 'number'
+       OR s.ddo_v1_json #>> '{{ddo,start_epoch}}' IS DISTINCT FROM s.start_epoch::TEXT
+       OR (s.alloc_expiration > s.start_epoch) IS NOT TRUE
+       OR (s.start_epoch >= {int(chain_head)} + {int(expected_seal_runway_epochs)}) IS NOT TRUE
+{scheduling_policy_guard}
+  ) THEN
+    RAISE EXCEPTION {scheduling_mismatch_message};
   END IF;
 END $$;
 
@@ -980,11 +1119,12 @@ WITH ins_deal AS (
 ), ins_audit AS (
   INSERT INTO audit_mk20_import_inserted (
     run_id, batch_name, csv_row_no, deal_id, deal_client, allocation_client_id, provider, provider_id,
-    piece_cid_v1, piece_cid_v2, allocation_id, car_url
+    piece_cid_v1, piece_cid_v2, allocation_id, start_epoch, alloc_expiration, car_url
   )
   SELECT
     {sql_literal(run_id)}, {sql_literal(batch_name)}, p.csv_row_no, p.deal_id, p.deal_client, p.allocation_client_id,
-    p.provider, p.provider_id, p.piece_cid_v1, p.piece_cid_v2, p.allocation_id, p.car_url
+    p.provider, p.provider_id, p.piece_cid_v1, p.piece_cid_v2, p.allocation_id,
+    p.start_epoch, p.alloc_expiration, p.car_url
   FROM picked p
   JOIN ins_deal d ON d.id = p.deal_id
   RETURNING deal_id
@@ -1008,7 +1148,9 @@ END $$;
 
 COMMIT;
 
-SELECT 'insert_result' AS section, run_id, batch_name, expected_rows, inserted_deals, inserted_waiting
+SELECT 'insert_result' AS section, run_id, batch_name, expected_rows, inserted_deals, inserted_waiting,
+       chain_head, explicit_start_epoch, start_before_allocation_expiration_epochs,
+       expected_seal_runway_epochs
 FROM audit_mk20_import_runs
 WHERE run_id = {sql_literal(run_id)};
 """
@@ -1018,7 +1160,11 @@ def generate_verify_sql(batch_name: str, stage_table: str, run_id: str) -> str:
     stage_table = validate_stage_table(stage_table)
     return f"""
 -- Verification for mk20 importer run_id={run_id}
-\nSELECT 'run_manifest' AS section, *
+\nSELECT 'run_manifest' AS section,
+       run_id, batch_name, created_at, limit_rows, expected_rows,
+       inserted_deals, inserted_waiting, chain_head,
+       explicit_start_epoch, start_before_allocation_expiration_epochs,
+       expected_seal_runway_epochs, notes
 FROM audit_mk20_import_runs
 WHERE run_id = {sql_literal(run_id)};
 
@@ -1079,6 +1225,57 @@ WHERE i.run_id = {sql_literal(run_id)}
     OR d.data #>> '{{source_http,urls,0,url}}' IS DISTINCT FROM i.car_url
   );
 
+SELECT 'bad_ddo_start_epoch' AS problem, d.id,
+       d.ddo_v1 #>> '{{ddo,start_epoch}}' AS ddo_start_epoch,
+       i.start_epoch AS audited_start_epoch
+FROM market_mk20_deal d
+JOIN audit_mk20_import_inserted i ON i.deal_id = d.id
+WHERE i.run_id = {sql_literal(run_id)}
+  AND (
+    jsonb_typeof(d.ddo_v1 #> '{{ddo,start_epoch}}') IS DISTINCT FROM 'number'
+    OR d.ddo_v1 #>> '{{ddo,start_epoch}}' IS DISTINCT FROM i.start_epoch::TEXT
+  );
+
+SELECT 'bad_allocation_start_order' AS problem, i.deal_id,
+       i.alloc_expiration, i.start_epoch
+FROM audit_mk20_import_inserted i
+WHERE i.run_id = {sql_literal(run_id)}
+  AND (
+    i.alloc_expiration IS NULL
+    OR i.start_epoch IS NULL
+    OR i.alloc_expiration <= i.start_epoch
+  );
+
+SELECT 'bad_allocation_start_buffer' AS problem, i.deal_id,
+       i.alloc_expiration, i.start_epoch,
+       r.start_before_allocation_expiration_epochs AS expected_buffer
+FROM audit_mk20_import_inserted i
+JOIN audit_mk20_import_runs r ON r.run_id = i.run_id
+WHERE i.run_id = {sql_literal(run_id)}
+  AND r.explicit_start_epoch IS NULL
+  AND (i.alloc_expiration - i.start_epoch)
+      IS DISTINCT FROM r.start_before_allocation_expiration_epochs;
+
+SELECT 'bad_explicit_start_epoch' AS problem, i.deal_id,
+       i.start_epoch, r.explicit_start_epoch
+FROM audit_mk20_import_inserted i
+JOIN audit_mk20_import_runs r ON r.run_id = i.run_id
+WHERE i.run_id = {sql_literal(run_id)}
+  AND r.explicit_start_epoch IS NOT NULL
+  AND i.start_epoch IS DISTINCT FROM r.explicit_start_epoch;
+
+SELECT 'insufficient_audited_start_runway' AS problem, i.deal_id,
+       i.start_epoch, r.chain_head, r.expected_seal_runway_epochs
+FROM audit_mk20_import_inserted i
+JOIN audit_mk20_import_runs r ON r.run_id = i.run_id
+WHERE i.run_id = {sql_literal(run_id)}
+  AND (
+    i.start_epoch IS NULL
+    OR r.chain_head IS NULL
+    OR r.expected_seal_runway_epochs IS NULL
+    OR i.start_epoch < r.chain_head + r.expected_seal_runway_epochs
+  );
+
 SELECT 'duplicate_piece_cid_v2_in_market_mk20_deal' AS problem,
        d.ddo_v1 #>> '{{ddo,provider}}' AS provider,
        d.piece_cid_v2,
@@ -1106,6 +1303,8 @@ SELECT 'sample_inserted_deals' AS section,
        i.csv_row_no, d.id, d.client, d.piece_cid_v2,
        d.ddo_v1 #>> '{{ddo,provider}}' AS provider,
        d.ddo_v1 #>> '{{ddo,allocation_id}}' AS allocation_id,
+       d.ddo_v1 #>> '{{ddo,start_epoch}}' AS ddo_start_epoch,
+       i.start_epoch, i.alloc_expiration,
        w.id IS NOT NULL AS still_waiting,
        dp.id IS NOT NULL AS in_download_pipeline,
        mp.id IS NOT NULL AS in_mk20_pipeline
@@ -1212,6 +1411,12 @@ WHERE i.run_id = {sql_literal(run_id)};
 
 def generate_observe_sql(batch_name: str, run_id: str) -> str:
     return f"""
+SELECT 'run_policy' AS section, run_id, batch_name, chain_head,
+       explicit_start_epoch, start_before_allocation_expiration_epochs,
+       expected_seal_runway_epochs
+FROM audit_mk20_import_runs
+WHERE run_id = {sql_literal(run_id)};
+
 SELECT 'waiting_joined' AS section, COUNT(*) AS count
 FROM market_mk20_pipeline_waiting w
 JOIN audit_mk20_import_inserted i ON i.deal_id = w.id
@@ -1241,6 +1446,7 @@ JOIN audit_mk20_import_inserted i
 WHERE i.run_id = {sql_literal(run_id)};
 
 SELECT i.csv_row_no, i.deal_id, i.piece_cid_v1, i.piece_cid_v2, i.allocation_id,
+       i.start_epoch, i.alloc_expiration,
        w.id IS NOT NULL AS still_waiting,
        dp.id IS NOT NULL AS in_download_pipeline,
        mp.id IS NOT NULL AS in_mk20_pipeline
@@ -1276,6 +1482,33 @@ def main() -> int:
     ap.add_argument("--provider-id", required=True, type=int, help="numeric provider/miner actor ID")
     ap.add_argument("--piece-size", default=34359738368, type=int)
     ap.add_argument("--duration", default=5256000, type=int)
+    ap.add_argument(
+        "--chain-head",
+        required=True,
+        type=int,
+        help="chain height snapshot used for StartEpoch safety validation",
+    )
+    ap.add_argument(
+        "--start-epoch",
+        default=None,
+        type=int,
+        help=(
+            "batch-wide absolute StartEpoch; when supplied, overrides the "
+            "per-allocation fallback calculation"
+        ),
+    )
+    ap.add_argument(
+        "--start-before-allocation-expiration-epochs",
+        default=DEFAULT_START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS,
+        type=int,
+        help="derive StartEpoch this many epochs before allocation expiration",
+    )
+    ap.add_argument(
+        "--expected-seal-runway-epochs",
+        default=DEFAULT_EXPECTED_SEAL_RUNWAY_EPOCHS,
+        type=int,
+        help="minimum runway required between chain head and selected StartEpoch",
+    )
     ap.add_argument("--stage-table", default="audit_mk20_import_stage")
     ap.add_argument("--replace-stage", action="store_true", help="delete prior rows for this batch_name from the stage table before loading")
     ap.add_argument("--reset-stage-table", action="store_true", help="drop and recreate the stage table before loading; useful after schema upgrades")
@@ -1302,6 +1535,16 @@ def main() -> int:
         raise SystemExit("--piece-size must be a positive power of two")
     if args.duration <= 0:
         raise SystemExit("--duration must be positive")
+    if args.chain_head <= 0:
+        raise SystemExit("--chain-head must be positive")
+    if args.start_epoch is not None and args.start_epoch <= 0:
+        raise SystemExit("--start-epoch must be positive when specified")
+    if args.start_before_allocation_expiration_epochs <= 0:
+        raise SystemExit(
+            "--start-before-allocation-expiration-epochs must be positive"
+        )
+    if args.expected_seal_runway_epochs <= 0:
+        raise SystemExit("--expected-seal-runway-epochs must be positive")
     if args.limit is not None and args.limit <= 0:
         raise SystemExit("--limit must be a positive integer when specified")
     if args.no_db and args.execute:
@@ -1339,6 +1582,8 @@ def main() -> int:
     candidates = read_csv_candidates(
         args.csv, args.batch_name, id_time_ms, allocations_by_piece,
         args.client_id, args.provider_id, args.piece_size, args.duration,
+        args.chain_head, args.start_before_allocation_expiration_epochs,
+        args.expected_seal_runway_epochs, args.start_epoch,
     )
 
     total = len(candidates)
@@ -1356,7 +1601,19 @@ def main() -> int:
 
     write_candidates_csv(validated_csv, candidates, args.provider, args.provider_id, args.deal_client, args.client_id, args.duration)
     stage_sql.write_text(generate_stage_sql(validated_csv, args.batch_name, args.stage_table, args.replace_stage, args.reset_stage_table), encoding="utf-8")
-    insert_sql.write_text(generate_insert_sql(args.batch_name, args.stage_table, args.limit, run_id), encoding="utf-8")
+    insert_sql.write_text(
+        generate_insert_sql(
+            args.batch_name,
+            args.stage_table,
+            args.limit,
+            run_id,
+            args.chain_head,
+            args.start_before_allocation_expiration_epochs,
+            args.expected_seal_runway_epochs,
+            args.start_epoch,
+        ),
+        encoding="utf-8",
+    )
     verify_sql.write_text(generate_verify_sql(args.batch_name, args.stage_table, run_id), encoding="utf-8")
     rollback_sql.write_text(generate_rollback_sql(args.batch_name, run_id), encoding="utf-8")
     observe_sql.write_text(generate_observe_sql(args.batch_name, run_id), encoding="utf-8")
@@ -1370,6 +1627,16 @@ def main() -> int:
     print(f"file-rejected candidates: {file_rejected}")
     print(f"deal client: {args.deal_client}")
     print(f"allocation client id: {args.client_id}")
+    print(f"chain head snapshot: {args.chain_head}")
+    if args.start_epoch is None:
+        print("start epoch mode: allocation-derived fallback")
+    else:
+        print(f"start epoch mode: explicit batch-wide ({args.start_epoch})")
+    print(
+        "start before allocation expiration: "
+        f"{args.start_before_allocation_expiration_epochs} epochs"
+    )
+    print(f"expected seal runway: {args.expected_seal_runway_epochs} epochs")
     print("top file validation results:")
     for reason, n in reject_counts.most_common(12):
         print(f"  {n:6d}  {reason}")

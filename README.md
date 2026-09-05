@@ -6,6 +6,8 @@ It is intended for an operator who already has a provider CSV and a freshly fetc
 
 > **Production warning:** `--execute` bypasses Curio's normal API and sanitize path and writes directly to production tables. Treat it as an operator-controlled production action. Start with one row, verify it, observe downstream progress, and scale only after the result is clean.
 
+Because this direct-DB path bypasses Curio's normal StartEpoch validation, the importer must write an explicit numeric StartEpoch for every valid candidate. It can use one operator-selected batch-wide epoch or derive an epoch from each allocation. A null StartEpoch is inappropriate for a large direct-DB batch: Curio would later resolve it to roughly the current chain head plus two days, concentrating thousands of deals around the same short activation deadline.
+
 ## What production insertion writes
 
 For a normal MK20 DDO HTTP-source deal, Curio's HTTP submission path initially writes:
@@ -17,8 +19,8 @@ This importer follows that initial shape. Curio's background pipeline consumes t
 
 A production run also creates or updates importer-owned audit data:
 
-- `audit_mk20_import_runs`
-- `audit_mk20_import_inserted`
+- `audit_mk20_import_runs`, including the supplied chain-head snapshot, nullable explicit StartEpoch, and fallback scheduling policy
+- `audit_mk20_import_inserted`, including each row's StartEpoch and allocation expiration
 
 ## Three execution levels
 
@@ -117,12 +119,61 @@ Common field-name casing variants are accepted for allocation ID, client, miner/
 
 Fetch allocations from current chain state immediately before staging. The importer trusts the supplied JSON; it does not query or refresh chain state itself.
 
+### Chain-head snapshot and StartEpoch policy
+
+Obtain a fresh chain height externally for every importer invocation:
+
+```bash
+CHAIN_HEAD=$(lotus chain head --height)
+```
+
+Pass it with required `--chain-head`. The importer does not invoke Lotus itself.
+
+The importer supports two scheduling modes.
+
+#### Explicit batch-wide StartEpoch
+
+Supply `--start-epoch` to give every valid candidate in the invocation exactly the same absolute chain epoch:
+
+```bash
+CHAIN_HEAD=$(lotus chain head --height)
+
+python3 mk20_db_importer.py \
+  ... \
+  --chain-head "$CHAIN_HEAD" \
+  --start-epoch 6427000
+```
+
+Every valid candidate in this run receives `StartEpoch = 6427000`. The value is not moved or clamped for an allocation that cannot safely use it; that candidate is rejected instead.
+
+`--start-epoch` takes precedence over `--start-before-allocation-expiration-epochs`. Supplying both is allowed. The fallback buffer is still recorded in the audit manifest for reproducibility, but it does not participate in the explicit-mode calculation.
+
+#### Allocation-derived fallback
+
+When `--start-epoch` is omitted, each candidate uses the expiration of its own matched allocation:
+
+```text
+start_epoch = allocation.expiration - 1440
+```
+
+Filecoin epochs are 30 seconds, so 1440 epochs is 12 hours. This is controlled by `--start-before-allocation-expiration-epochs`, whose default is `1440`. Allocations with different expiration epochs may therefore produce different StartEpoch values.
+
+For both modes, StartEpoch must be positive, must be at least `chain_head + expected_seal_runway_epochs`, and must be strictly less than that candidate's allocation expiration. The default expected sealing runway is `960` epochs, or 8 hours. Equality at the exact runway boundary is accepted; equality with allocation expiration is rejected.
+
+The requested DDO duration remains unchanged in both modes.
+
+StartEpoch is an activation deadline and safety value, **not** a throughput throttle. Setting it explicitly does not prevent a large import from creating substantial downstream download, CommP, aggregation, sealing, or message load. Curio-side release and backpressure remain separate operational concerns.
+
 ## File-side validation
 
 Before any database operation, the importer validates the CLI configuration, allocation JSON, and every CSV row.
 
 CLI and allocation validation includes:
 
+- `--chain-head` is required and must be positive.
+- `--start-epoch`, when supplied, must be positive. It selects explicit batch-wide mode and takes precedence over the fallback buffer.
+- `--start-before-allocation-expiration-epochs` must be positive; its default is `1440`.
+- `--expected-seal-runway-epochs` must be positive; its default is `960`.
 - `--client-id` and `--provider-id` must be positive.
 - `--provider` must be an `f0...` or `t0...` ID address whose encoded actor ID equals `--provider-id`.
 - `--piece-size` must be a positive power of two.
@@ -134,6 +185,8 @@ CLI and allocation validation includes:
 - Each CSV piece must resolve to exactly one matching allocation in the supplied allocation JSON.
 - The CSV piece CID and allocation piece CID must match.
 - Deal duration must be within the allocation's valid `term_min` / `term_max` range, and an invalid allocation term range is rejected.
+- With `--start-epoch`, every uniquely matched candidate receives that exact batch-wide value. Without it, every candidate gets `start_epoch = allocation.expiration - start_before_allocation_expiration_epochs` from its own allocation.
+- A candidate is rejected if its selected StartEpoch is non-positive, is behind the supplied chain head, is below `chain_head + expected_seal_runway_epochs`, or is not strictly before its allocation expiration.
 
 Piece and source validation includes:
 
@@ -190,6 +243,8 @@ PROVIDER=<provider-ID-address>
 PROVIDER_ID=<numeric-provider-actor-id>
 PIECE_SIZE=34359738368
 DURATION=5256000
+START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS=1440
+EXPECTED_SEAL_RUNWAY_EPOCHS=960
 
 YSQL_CURIO='ysqlsh ...'
 ```
@@ -200,6 +255,7 @@ This command does not connect to the database. It validates the complete input a
 
 ```bash
 RUN_ID="${BATCH_NAME}_filecheck_$(date +%Y%m%d_%H%M%S)"
+CHAIN_HEAD=$(lotus chain head --height)
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -213,6 +269,9 @@ python3 "$SCRIPT" \
   --client-id "$ALLOCATION_CLIENT_ID" \
   --piece-size "$PIECE_SIZE" \
   --duration "$DURATION" \
+  --chain-head "$CHAIN_HEAD" \
+  --start-before-allocation-expiration-epochs "$START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS" \
+  --expected-seal-runway-epochs "$EXPECTED_SEAL_RUNWAY_EPOCHS" \
   --replace-stage \
   --limit 1 \
   --no-db
@@ -226,6 +285,7 @@ Omit both `--no-db` and `--execute`. This runs the stage SQL, loads `audit_mk20_
 
 ```bash
 RUN_ID="${BATCH_NAME}_dbcheck_$(date +%Y%m%d_%H%M%S)"
+CHAIN_HEAD=$(lotus chain head --height)
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -239,6 +299,9 @@ python3 "$SCRIPT" \
   --client-id "$ALLOCATION_CLIENT_ID" \
   --piece-size "$PIECE_SIZE" \
   --duration "$DURATION" \
+  --chain-head "$CHAIN_HEAD" \
+  --start-before-allocation-expiration-epochs "$START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS" \
+  --expected-seal-runway-epochs "$EXPECTED_SEAL_RUNWAY_EPOCHS" \
   --replace-stage \
   --limit 1 \
   --psql-cmd "$YSQL_CURIO"
@@ -306,6 +369,7 @@ Use a new run ID and insert one row:
 
 ```bash
 RUN_ID="${BATCH_NAME}_canary1_$(date +%Y%m%d_%H%M%S)"
+CHAIN_HEAD=$(lotus chain head --height)
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -319,6 +383,9 @@ python3 "$SCRIPT" \
   --client-id "$ALLOCATION_CLIENT_ID" \
   --piece-size "$PIECE_SIZE" \
   --duration "$DURATION" \
+  --chain-head "$CHAIN_HEAD" \
+  --start-before-allocation-expiration-epochs "$START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS" \
+  --expected-seal-runway-epochs "$EXPECTED_SEAL_RUNWAY_EPOCHS" \
   --replace-stage \
   --psql-cmd "$YSQL_CURIO" \
   --execute \
@@ -371,6 +438,7 @@ Example 100-row step:
 
 ```bash
 RUN_ID="${BATCH_NAME}_chunk100_$(date +%Y%m%d_%H%M%S)"
+CHAIN_HEAD=$(lotus chain head --height)
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -384,6 +452,9 @@ python3 "$SCRIPT" \
   --client-id "$ALLOCATION_CLIENT_ID" \
   --piece-size "$PIECE_SIZE" \
   --duration "$DURATION" \
+  --chain-head "$CHAIN_HEAD" \
+  --start-before-allocation-expiration-epochs "$START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS" \
+  --expected-seal-runway-epochs "$EXPECTED_SEAL_RUNWAY_EPOCHS" \
   --replace-stage \
   --psql-cmd "$YSQL_CURIO" \
   --execute \
@@ -398,6 +469,7 @@ For the full valid remainder, omit `--limit` and explicitly add `--allow-full-ba
 
 ```bash
 RUN_ID="${BATCH_NAME}_remaining_$(date +%Y%m%d_%H%M%S)"
+CHAIN_HEAD=$(lotus chain head --height)
 
 python3 "$SCRIPT" \
   --allocations "$ALLOC" \
@@ -411,6 +483,9 @@ python3 "$SCRIPT" \
   --client-id "$ALLOCATION_CLIENT_ID" \
   --piece-size "$PIECE_SIZE" \
   --duration "$DURATION" \
+  --chain-head "$CHAIN_HEAD" \
+  --start-before-allocation-expiration-epochs "$START_BEFORE_ALLOCATION_EXPIRATION_EPOCHS" \
+  --expected-seal-runway-epochs "$EXPECTED_SEAL_RUNWAY_EPOCHS" \
   --replace-stage \
   --psql-cmd "$YSQL_CURIO" \
   --execute \
@@ -430,11 +505,12 @@ $YSQL_CURIO -v ON_ERROR_STOP=1 -f "mk20-import-out/${BATCH_NAME}.${RUN_ID}.obser
 These are different constraints:
 
 - **Allocation expiration** is the chain epoch by which the allocation must be successfully claimed through sector activation.
+- **DDO StartEpoch** is the explicit deal-start deadline carried in the imported DDO. It is either the operator-supplied batch-wide `--start-epoch` or, by default, 1440 epochs before that candidate's own allocation expiration. Both modes reject candidates that lack the configured sealing runway or whose StartEpoch is not strictly before allocation expiration.
 - **Deal duration** must satisfy the allocation's `term_min` and `term_max`; it is not the remaining time until allocation expiration.
 - **Local sealing completion** means local PC1/PC2/C2 work has progressed, but it does not prove that the allocation was claimed.
 - **Successful on-chain sector activation / allocation claim** requires the relevant chain message to land successfully before allocation expiration.
 
-Merely finishing local PC1/PC2/C2 work is not sufficient. Plan from current chain epoch to each allocation's expiration using actual sustained throughput and a substantial reserve for download delays, queue/backpressure, failed sectors, retries, message batching, and on-chain submission failures.
+Merely finishing local PC1/PC2/C2 work is not sufficient. Refresh `--chain-head` for every run and plan from that snapshot to each candidate's StartEpoch and allocation expiration using actual sustained throughput and a substantial reserve for download delays, queue/backpressure, failed sectors, retries, message batching, and on-chain submission failures.
 
 Illustrative capacity calculation only:
 
@@ -445,7 +521,15 @@ The 48 TiB/day figure is an example assumption, not importer performance and not
 
 ## Verification and duplicate checks
 
-Each production run's `verify.sql` checks audit/deal/waiting counts, persisted client/provider/allocation/piece/URL values, same-provider PieceCIDv2 duplicates, and allocation-ID duplicates.
+Each production run's `verify.sql` checks audit/deal/waiting counts, persisted client/provider/allocation/piece/URL values, same-provider PieceCIDv2 duplicates, and allocation-ID duplicates. It also checks that:
+
+- the numeric `ddo_v1.ddo.start_epoch` equals the per-row audited StartEpoch;
+- audited allocation expiration is greater than StartEpoch;
+- in explicit mode, every audited StartEpoch equals the run's nullable `explicit_start_epoch` mode marker;
+- in fallback mode, `alloc_expiration - start_epoch` equals the run's recorded `start_before_allocation_expiration_epochs`;
+- no audited StartEpoch is below the recorded `chain_head + expected_seal_runway_epochs`.
+
+All problem queries must return zero rows. The sample output includes both StartEpoch and allocation expiration for direct comparison.
 
 To check importer-created rows across a batch:
 
@@ -559,8 +643,8 @@ The PieceCID tests use official FRC-0069/`go-fil-commcid` reference vectors for 
 
 - The importer targets the currently verified Curio MK20 DDO schema and YugabyteDB v2025.1+ advisory-lock path. Reinspect source and schema before using it with another Curio or database version.
 - The advisory lock coordinates cooperating importer instances only; it does not block unrelated Curio/API writers.
-- The importer does not query chain state, confirm current epoch, monitor allocation consumption, or prove on-chain activation. It trusts the supplied allocation JSON.
-- It records allocation expiration for audit output but does not reject a row based on current epoch or calculate deadline safety.
+- The importer does not query chain state itself. It trusts the operator-supplied `--chain-head` snapshot and allocation JSON, so stale inputs can overstate remaining runway. Obtain fresh values for every run.
+- It validates allocation-derived StartEpoch against that supplied snapshot, but it does not monitor later allocation consumption or prove on-chain activation.
 - It does not enforce equality between CAR size and PieceCIDv2 raw payload size.
-- It does not manage Curio backpressure, sealing capacity, or on-chain message submission.
+- StartEpoch is not backpressure. The importer does not manage Curio release rate, sealing capacity, or on-chain message submission; a large accepted batch can still create substantial downstream load.
 - It does not replace normal Curio monitoring, backups, or operator judgment.
